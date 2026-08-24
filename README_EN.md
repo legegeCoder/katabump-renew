@@ -27,17 +27,17 @@ This is the easiest way to set it up once and have it run automatically every da
     [{"username": "your_email@example.com", "password": "your_password"}, {"username": "another@example.com", "password": "pwd"}]
     ```
 5.  **(Optional) Configure Proxy**:
-    If you need to run behind a proxy (e.g. to avoid IP blocks), set a Secret named `PROXY_LIST_URL` (self-hosted list, http/socks supported) or `WEBSHARE_PROXY_LIST_URL` (Webshare list). You can also commit a `proxies.txt` file to the repo.
-    -   **Supported proxy line formats**:
-        -   `HOST:PORT`
-        -   `HOST:PORT:USERNAME:PASSWORD` (Webshare format, treated as http proxy)
-        -   `http://USERNAME:PASSWORD@HOST:PORT`
-        -   `http://HOST:PORT` (self-hosted, no auth)
-        -   `socks5://HOST:PORT`
-        -   `socks5://USERNAME:PASSWORD@HOST:PORT`
-        -   `socks4://HOST:PORT`
-    -   **Note**: Ports must be decimal values from 1 to 65535. Paths, query strings, fragments, extra fields, and unsafe host characters are rejected. Lines without a scheme prefix are parsed only as the Webshare format (http proxy). `https://` and authenticated `socks4://` are not supported.
-    -   **Note**: Chromium does not support SOCKS username/password authentication. Authenticated socks5 lines are parsed and preflighted, but browser traffic carries no credentials — use an IP whitelist on your self-hosted SOCKS proxy, or use an http proxy when auth is required.
+    If you need to run behind a proxy, choose one of:
+    -   **`PROXY_URL` (recommended for proxy-pool gateways like [Resin](https://github.com/Resinat/Resin))**: a single proxy entrypoint, e.g. `http://Default.katabump:my-token@resin.example.com:2260` (auth format `Platform.Account:RESIN_PROXY_TOKEN`). Single-proxy mode retries the same entry on failure (no cooldown, up to 3 attempts) because the gateway rotates exit nodes internally. Use the `http://` form — Chromium does not support SOCKS auth.
+    -   **`PROXY_LIST_URL` / `WEBSHARE_PROXY_LIST_URL`**: URL of a plain-text proxy list (one proxy per line) for rotation.
+    -   Or commit a `proxies.txt` file to the repo.
+    -   **Supported proxy line formats** (applies to `PROXY_URL` and each line of `proxies.txt`):
+        -   `http://[USERNAME:PASSWORD@]HOST:PORT`
+        -   `socks5://[USERNAME:PASSWORD@]HOST:PORT` (also `socks5h://`, normalized to socks5)
+        -   `socks4://HOST:PORT` (also `socks4a://`, normalized to socks4)
+        -   `HOST:PORT` / `HOST:PORT:USERNAME:PASSWORD` (treated as http proxy, Webshare format)
+    -   **Note**: Ports must be decimal values from 1 to 65535. Paths, query strings, fragments, extra fields, and unsafe host characters are rejected. `https://` and authenticated `socks4://` are not supported.
+    -   **Note**: Chromium does not support SOCKS username/password authentication; browser traffic carries no credentials for socks proxies — use IP whitelists or http proxies when auth is required.
     -   **Note**: The script validates the proxy before use (HTTP request for http proxies, real SOCKS handshake for socks proxies).
 6.  **(Optional) Telegram Notifications**:
     If you want to receive Telegram notifications (with screenshots) upon renewal success, failure, or skip, add the following Secrets:

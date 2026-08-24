@@ -126,7 +126,9 @@ const CHROME_BOOT_TIMEOUT_MS = getChromeBootTimeoutMs(process.env.CHROME_BOOT_TI
 if (HTTP_PROXY) {
     try {
         const proxyUrl = new URL(HTTP_PROXY);
-        const scheme = proxyUrl.protocol.replace(/:$/, '').toLowerCase();
+        const rawScheme = proxyUrl.protocol.replace(/:$/, '').toLowerCase();
+        // socks5h/socks4a 与 socks5/socks4 对客户端等价（DNS 均在代理端解析），统一归一化
+        const scheme = rawScheme === 'socks5h' ? 'socks5' : rawScheme === 'socks4a' ? 'socks4' : rawScheme;
         if (!PROXY_DEFAULT_PORTS[scheme]) {
             throw new Error(`不支持的代理协议: ${proxyUrl.protocol}（支持 http/socks4/socks5）`);
         }

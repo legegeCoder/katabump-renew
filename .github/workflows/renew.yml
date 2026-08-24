@@ -106,6 +106,7 @@ jobs:
         USERS_JSON: ${{ secrets.USERS_JSON }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        PROXY_URL: ${{ secrets.PROXY_URL }}
       run: |
         xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node proxy_runner.js
 

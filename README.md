@@ -20,9 +20,10 @@
 - `USERS_JSON` Secret 配置账号
 - 可选 Telegram 通知
 - 自动上传运行截图 Artifacts
+- Resin 自建代理池网关接入（PROXY_URL 单入口，失败重试不冷却）
 - Webshare 代理列表自动下载
-- 自建 http / socks4 / socks5 代理支持（自建入口无需认证或带认证均可）
-- 从代理列表中随机选择出口，失败自动轮换与冷却
+- 通用自建 http / socks4 / socks5 代理支持（免认证或带认证均可）
+- 多代理列表随机选择出口，失败自动轮换与冷却
 - 自动写入 `HTTP_PROXY` / `HTTPS_PROXY`
 - 代理出口预检（http 走 HTTP 请求，socks 走真实 SOCKS 握手）
 - 识别 KataBump “还没到续期时间”的状态
@@ -66,36 +67,35 @@ Settings → Secrets and variables → Actions → New repository secret
 
 ---
 
-## 🌐 代理配置（Webshare / 自建 http/socks）
+## 🌐 代理配置（Resin 自建 / Webshare / 通用 http/socks）
 
-代理列表有两个来源，二选一即可：
+按场景三选一：
 
-- **Webshare**：https://www.webshare.io/?referral_code=sfojw2m7nss0 ，配置 `WEBSHARE_PROXY_LIST_URL` Secret。
-- **自建代理（Resin 等）**：配置 `PROXY_LIST_URL` Secret，指向你自己服务上的代理列表下载链接（支持 http / socks4 / socks5）。
+| 场景 | 配置方式 |
+| --- | --- |
+| Resin 等代理池网关（单一入口，推荐） | `PROXY_URL` Secret |
+| 多个独立代理轮换 | `PROXY_LIST_URL`（自建列表）或 `WEBSHARE_PROXY_LIST_URL`（Webshare）|
+| 固定少量代理 | 直接提交 `proxies.txt` 到仓库 |
 
-如果两个 Secret 都没配置，也可以直接把 `proxies.txt` 提交到仓库里（注意别泄露敏感信息）。
+`PROXY_URL` 优先级最高；其次是下载列表；都没配则用仓库里的 `proxies.txt`，否则直连。
 
-### 代理列表支持的行格式
+### `PROXY_URL` 可选（Resin 代理池网关，推荐）
+
+[Resin](https://github.com/Resinat/Resin) 这类代理池网关把节点聚合成**单一统一入口**（同时提供 HTTP/SOCKS5 正向代理，内部自动调度节点、健康检查与故障切换），因此不需要代理列表轮换 —— 只需把入口当作一个代理直接配置。
+
+填写 Resin 的入口地址（认证格式 `Platform.Account:RESIN_PROXY_TOKEN`）：
 
 ```text
-HOST:PORT
-HOST:PORT:USERNAME:PASSWORD
-http://USERNAME:PASSWORD@HOST:PORT
-http://HOST:PORT
-socks5://HOST:PORT
-socks5://USERNAME:PASSWORD@HOST:PORT
-socks4://HOST:PORT
+http://Default.katabump:my-token@resin.example.com:2260
 ```
 
-说明：
+- `http://` 前缀：HTTP 正向代理（推荐，浏览器支持认证）。
+- `socks5://` / `socks5h://`：SOCKS5 正向代理。⚠️ Chromium 不支持 SOCKS 认证，若需使用请在 Resin 侧设置 `RESIN_PROXY_TOKEN=""`（免认证）并配 IP 白名单。
+- 单代理模式下失败不冷却，间隔 5 秒直接重试同一入口（最多 3 次），因为 Resin 内部会自动换出口节点；3 次均失败后仍会降级直连 fallback。
 
-- 不带协议前缀的行（`HOST:PORT` / `HOST:PORT:USERNAME:PASSWORD`）按 Webshare 格式解释，一律视为 http 代理。
-- 自建代理请用带协议前缀的 URL 写法；`socks5` / `socks4` 必须显式写协议。
-- `PORT` 必须是 1 到 65535 的十进制端口。URL 中的用户名和密码按 URL 编码填写。
-- 路径、查询参数、片段、多余字段以及包含空白、`@` 或反斜杠的主机会被拒绝；`https://` 和 `socks4` 带认证不支持。
-- ⚠️ Chromium 不支持 SOCKS 用户名/密码认证：`socks5://USER:PASS@HOST:PORT` 可以解析和预检，但浏览器流量不会携带凭据。自建 socks 代理建议改用 IP 白名单或免认证端口；需要认证的代理请使用 http 协议。
+> 注意：`PROXY_URL` 必须是 Resin 的**代理入口地址**（形如 `http(s)://[Platform.Account:Token@]HOST:PORT`），不是 Resin 的 WebUI 地址，也不是节点订阅下载链接。
 
-### `WEBSHARE_PROXY_LIST_URL` 可选（Webshare）
+### `WEBSHARE_PROXY_LIST_URL` 可选（Webshare 多代理轮换）
 
 填写 Webshare 的代理列表下载链接，格式一般是：
 
@@ -105,9 +105,9 @@ socks4://HOST:PORT
 
 这样 Webshare 后续更换代理 IP 时，通常不需要手动更新 GitHub Secret。
 
-### `PROXY_LIST_URL` 可选（自建代理）
+### `PROXY_LIST_URL` 可选（自建多代理轮换）
 
-填写你自己服务上代理列表的下载链接，例如：
+填写你自己服务上代理列表的下载链接，每行一条，例如：
 
 ```text
 socks5://1.2.3.4:1080
@@ -115,19 +115,37 @@ socks5://5.6.7.8:1080
 http://user:pass@9.9.9.9:8080
 ```
 
+> ⚠️ 这里必须是**纯代理列表文本**。不要填 Resin 订阅链接、Clash/sing-box 配置、vmess:// 节点订阅或 HTML 页面 —— 这些不是浏览器可用的正向代理格式，会全部解析失败。Resin 用户请改用上面的 `PROXY_URL`。
+
+列表模式下失败代理自动冷却 26 小时并轮换到下一条。
+
 workflow 会自动执行：
 
 ```text
-下载代理列表（PROXY_LIST_URL 或 WEBSHARE_PROXY_LIST_URL）
+获取代理（PROXY_URL 单入口，或下载代理列表）
 ↓
-解析并校验每行代理（http/socks4/socks5）
+解析并校验（http/socks4/socks5，socks5h/socks4a 自动归一化）
 ↓
-随机选择一条可用代理，失败的自动冷却并轮换
+单代理模式：失败重试同一入口；列表模式：失败冷却并轮换
 ↓
 写入 HTTP_PROXY / HTTPS_PROXY
 ↓
 运行 action_renew.js（http 代理走 HTTP 预检，socks 代理走真实 SOCKS 握手预检）
 ```
+
+代理行格式完整列表（`PROXY_URL` 与 `proxies.txt` 每行通用）：
+
+```text
+http://[USERNAME:PASSWORD@]HOST:PORT
+socks5://[USERNAME:PASSWORD@]HOST:PORT
+socks5h://[USERNAME:PASSWORD@]HOST:PORT   （自动归一化为 socks5）
+socks4://HOST:PORT
+socks4a://HOST:PORT                       （自动归一化为 socks4）
+HOST:PORT                                 （视为 http 代理）
+HOST:PORT:USERNAME:PASSWORD               （视为 http 代理，Webshare 格式）
+```
+
+限制：`PORT` 必须 1–65535；路径/查询/片段/多余字段拒绝；`https://`、带认证的 `socks4://` 不支持；Chromium 不支持 SOCKS 认证（预检可用，浏览器流量不带凭据）。
 
 > 注意：两个下载链接 Secret 里可能包含 token，不要写进代码，不要公开贴到 README、Issue 或日志里，只放到 GitHub Secrets。
 
@@ -295,6 +313,7 @@ Workflow 是本项目唯一支持的运行方式：Ubuntu、Node.js 24、Xvfb，
 ```text
 USERS_JSON
 KataBump 邮箱密码
+PROXY_URL（含 Resin Token）
 PROXY_LIST_URL
 WEBSHARE_PROXY_LIST_URL
 HTTP_PROXY 完整链接
@@ -311,13 +330,13 @@ TG_CHAT_ID
 
 ## 🧯 常见问题
 
-### 1. `PROXY_LIST_URL` / `WEBSHARE_PROXY_LIST_URL` 均为空
+### 1. 所有代理 Secret 均为空
 
-说明你没有配置代理列表下载链接。脚本会使用仓库里提交的 `proxies.txt`（如果有），否则直连运行。
+说明你没有配置任何代理。脚本会直连运行。
 
-### 2. `Proxy line format invalid`
+### 2. `第 N 行无效：invalid_field_count:1` / `invalid_url_format`
 
-说明下载到的代理列表行不是本文档列出的格式，或使用了不支持的协议（如 `https://`、带认证的 `socks4://`）。请检查代理列表格式设置。
+下载到的内容不是纯代理列表（每行缺少 `HOST:PORT` 结构）。常见原因：把 Resin 订阅链接、Clash/sing-box 配置、vmess:// 节点订阅或 HTML 页面填进了 `PROXY_LIST_URL`。Resin 用户请改用 `PROXY_URL` 直接配置代理入口。
 
 ### 3. `用户处理完成 | 状态: not_ready`
 

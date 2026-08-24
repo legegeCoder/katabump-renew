@@ -61,6 +61,22 @@ function tests() {
             expect: { scheme: 'socks4', ip: '1.2.3.4', port: '1080', username: '', password: '', valid: true }
         },
         {
+            line: 'socks5h://user:pass@1.2.3.4:1080',
+            expect: { scheme: 'socks5', ip: '1.2.3.4', port: '1080', username: 'user', password: 'pass', valid: true }
+        },
+        {
+            line: 'SOCKS5H://1.2.3.4:1080',
+            expect: { scheme: 'socks5', ip: '1.2.3.4', port: '1080', username: '', password: '', valid: true }
+        },
+        {
+            line: 'socks4a://1.2.3.4:1080',
+            expect: { scheme: 'socks4', ip: '1.2.3.4', port: '1080', username: '', password: '', valid: true }
+        },
+        {
+            line: 'http://Default.katabump:my-token@1.2.3.4:2260',
+            expect: { scheme: 'http', ip: '1.2.3.4', port: '2260', username: 'Default.katabump', password: 'my-token', valid: true }
+        },
+        {
             line: 'socks4://user:pass@1.2.3.4:1080',
             expect: { valid: false, reason: 'socks4_auth_unsupported' }
         },
@@ -494,6 +510,13 @@ function tests() {
         assert.strictEqual(cleaned.http_proxy, 'socks5://1.2.3.4:1080');
         assert.strictEqual(cleaned.HTTPS_PROXY, 'socks5://1.2.3.4:1080');
         assert.strictEqual(cleaned.https_proxy, 'socks5://1.2.3.4:1080');
+    }
+
+    // socks5h 输入应归一化为 socks5 构建 URL（对客户端等价）
+    {
+        const parsed = mod.parseProxyLine('socks5h://user:pass@1.2.3.4:1080');
+        assert.strictEqual(mod.buildProxyUrl(parsed), 'socks5://user:pass@1.2.3.4:1080');
+        assert.strictEqual(mod.proxyKey(parsed), 'socks5://1.2.3.4:1080');
     }
 
     console.log('[proxy-runner tests] all tests passed');

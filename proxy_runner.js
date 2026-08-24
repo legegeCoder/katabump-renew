@@ -16,6 +16,11 @@ const ACTION_TIMEOUT_MINUTES = normalizeTimeoutMinutes(process.env.ACTION_TIMEOU
 const ACTION_TIMEOUT_MS = ACTION_TIMEOUT_MINUTES * 60 * 1000;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
+// 单一代理入口直配（如 Resin 代理池网关），优先级高于 proxies.txt / PROXY_LIST_URL
+const PROXY_URL = (process.env.PROXY_URL || '').trim();
+// 单代理模式下 PROXY_RETRY 不冷却，直接重试同一入口（代理池内部会自动换节点）
+const SINGLE_PROXY_MAX_ATTEMPTS = 3;
+const SINGLE_PROXY_RETRY_DELAY_MS = 5_000;
 
 function parsePositiveNumber(value, fallback) {
     const parsed = Number(value);
@@ -283,7 +288,9 @@ function removeExpiredCooldowns(cooldowns) {
 const SUPPORTED_PROXY_SCHEMES = {
     'http:': 'http',
     'socks4:': 'socks4',
-    'socks5:': 'socks5'
+    'socks4a:': 'socks4',
+    'socks5:': 'socks5',
+    'socks5h:': 'socks5'
 };
 
 function parseProxyLine(line, lineNumber) {
@@ -486,6 +493,15 @@ function safeProxyId(parsed) {
 //  代理选择
 // ============================================================
 function loadProxies() {
+    if (PROXY_URL) {
+        const parsed = parseProxyLine(PROXY_URL);
+        if (parsed.valid && buildProxyUrl(parsed)) {
+            console.log(`[proxy-runner] 使用 PROXY_URL 单代理入口: ${safeProxyId(parsed)}（失败不冷却，代理池内部自动换节点）`);
+            return { configured: true, valid: [parsed], invalidCount: 0 };
+        }
+        console.error(`[proxy-runner] PROXY_URL 无效（reason=${parsed.reason}），支持 http/socks5://[USER:PASS@]HOST:PORT`);
+        return { configured: true, valid: [], invalidCount: 1, invalidUrl: true };
+    }
     if (!fs.existsSync(CONFIG.PROXIES_FILE)) {
         console.log('[proxy-runner] proxies.txt 不存在，直接运行（无代理）');
         return { configured: false, valid: [], invalidCount: 0 };
@@ -621,15 +637,18 @@ async function runProxyWorkflow(attempts) {
 
     const proxyResult = loadProxies();
     const proxies = proxyResult.valid;
+    // 单代理入口（PROXY_URL 或列表仅 1 条）：失败不冷却直接重试同一入口，
+    // 适用于 Resin 等代理池网关（网关内部已做节点调度与故障切换）。
+    const singleProxyMode = proxies.length === 1;
     let cooldowns = loadCooldowns();
     removeExpiredCooldowns(cooldowns);
 
     const attemptedProxyKeys = new Set();
-    const candidates = buildProxyCandidateQueue(proxies, cooldowns, attemptedProxyKeys);
+    const candidates = buildProxyCandidateQueue(proxies, singleProxyMode ? {} : cooldowns, attemptedProxyKeys);
     const maxAttempts = proxies.length > 0
-        ? getMaxProxyAttempts(candidates.length)
+        ? (singleProxyMode ? SINGLE_PROXY_MAX_ATTEMPTS : getMaxProxyAttempts(candidates.length))
         : 0;
-    console.log(`[proxy-runner] 有效代理 ${proxies.length} 条，冷却后候选 ${candidates.length} 条，本轮最多检查 ${maxAttempts} 条`);
+    console.log(`[proxy-runner] 有效代理 ${proxies.length} 条，冷却后候选 ${candidates.length} 条，本轮最多检查 ${maxAttempts} 条${singleProxyMode ? '（单代理模式：重试同一入口，不冷却）' : ''}`);
 
     let directFallbackAttempted = false;
 
@@ -646,6 +665,14 @@ async function runProxyWorkflow(attempts) {
     }
 
     if (proxyResult.configured && proxies.length === 0) {
+        if (proxyResult.invalidUrl) {
+            console.log('[proxy-runner] PROXY_URL 配置无效，禁止静默直连');
+            return finalizeWorkflow(EXIT_CODE.FATAL, {
+                status: 'error',
+                message: 'Invalid PROXY_URL configuration',
+                accounts: []
+            }, attempts, maxAttempts);
+        }
         console.log('[proxy-runner] proxies.txt 存在但无有效代理，禁止静默直连');
         return finalizeWorkflow(EXIT_CODE.NO_PROXY_AVAILABLE, {
             status: 'no_proxy_available',
@@ -673,7 +700,7 @@ async function runProxyWorkflow(attempts) {
             while (candidates.length > 0) {
                 const candidate = candidates.shift();
                 const key = proxyKey(candidate);
-                if (attemptedProxyKeys.has(key)) continue;
+                if (!singleProxyMode && attemptedProxyKeys.has(key)) continue;
                 attemptedProxyKeys.add(key);
                 selection = candidate;
                 break;
@@ -709,6 +736,12 @@ async function runProxyWorkflow(attempts) {
 
         if (code === EXIT_CODE.PROXY_RETRY && selection) {
             const parsed = selection;
+            if (singleProxyMode) {
+                console.log(`[proxy-runner] 单代理模式：入口 ${safeProxyId(parsed)} 保持不冷却，${SINGLE_PROXY_RETRY_DELAY_MS / 1000}s 后直接重试同一入口`);
+                candidates.push(parsed);
+                await new Promise(resolve => setTimeout(resolve, SINGLE_PROXY_RETRY_DELAY_MS));
+                continue;
+            }
             const key = proxyKey(parsed);
             addCooldown(cooldowns, key, 'proxy_retry_from_action_renew');
             cooldowns = loadCooldowns();
@@ -728,7 +761,7 @@ async function runProxyWorkflow(attempts) {
 
     if (
         !directFallbackAttempted &&
-        candidates.length === 0 &&
+        (candidates.length === 0 || singleProxyMode) &&
         attempts.length > 0 &&
         attempts.every(isRealProxyNetworkFailure)
     ) {
