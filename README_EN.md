@@ -27,13 +27,18 @@ This is the easiest way to set it up once and have it run automatically every da
     [{"username": "your_email@example.com", "password": "your_password"}, {"username": "another@example.com", "password": "pwd"}]
     ```
 5.  **(Optional) Configure Proxy**:
-    If you need to run behind a proxy (e.g. to avoid IP blocks), add a Secret named `HTTP_PROXY`.
+    If you need to run behind a proxy (e.g. to avoid IP blocks), set a Secret named `PROXY_LIST_URL` (self-hosted list, http/socks supported) or `WEBSHARE_PROXY_LIST_URL` (Webshare list). You can also commit a `proxies.txt` file to the repo.
     -   **Supported proxy line formats**:
         -   `HOST:PORT`
-        -   `HOST:PORT:USERNAME:PASSWORD`
+        -   `HOST:PORT:USERNAME:PASSWORD` (Webshare format, treated as http proxy)
         -   `http://USERNAME:PASSWORD@HOST:PORT`
-    -   **Note**: Ports must be decimal values from 1 to 65535. Paths, query strings, fragments, extra fields, and unsafe host characters are rejected. Lines without `http://` are parsed only as the Webshare format.
-    -   **Note**: The script validates the proxy before use. Default is disabled.
+        -   `http://HOST:PORT` (self-hosted, no auth)
+        -   `socks5://HOST:PORT`
+        -   `socks5://USERNAME:PASSWORD@HOST:PORT`
+        -   `socks4://HOST:PORT`
+    -   **Note**: Ports must be decimal values from 1 to 65535. Paths, query strings, fragments, extra fields, and unsafe host characters are rejected. Lines without a scheme prefix are parsed only as the Webshare format (http proxy). `https://` and authenticated `socks4://` are not supported.
+    -   **Note**: Chromium does not support SOCKS username/password authentication. Authenticated socks5 lines are parsed and preflighted, but browser traffic carries no credentials — use an IP whitelist on your self-hosted SOCKS proxy, or use an http proxy when auth is required.
+    -   **Note**: The script validates the proxy before use (HTTP request for http proxies, real SOCKS handshake for socks proxies).
 6.  **(Optional) Telegram Notifications**:
     If you want to receive Telegram notifications (with screenshots) upon renewal success, failure, or skip, add the following Secrets:
     -   `TG_BOT_TOKEN`: Your Telegram Bot Token (from @BotFather).

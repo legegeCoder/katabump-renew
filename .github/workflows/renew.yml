@@ -70,8 +70,20 @@ jobs:
     - name: Download proxy list
       env:
         WEBSHARE_PROXY_LIST_URL: ${{ secrets.WEBSHARE_PROXY_LIST_URL }}
+        PROXY_LIST_URL: ${{ secrets.PROXY_LIST_URL }}
       run: |
-        if [ -n "$WEBSHARE_PROXY_LIST_URL" ]; then
+        if [ -n "$PROXY_LIST_URL" ]; then
+          echo "Downloading self-hosted proxy list (http/socks supported)..."
+          curl -fsSL \
+            --retry 3 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            --max-time 90 \
+            "${PROXY_LIST_URL}" \
+            -o proxies.txt
+          echo "Proxy list downloaded. Lines: $(wc -l < proxies.txt)"
+        elif [ -n "$WEBSHARE_PROXY_LIST_URL" ]; then
           echo "Downloading Webshare proxy list..."
           curl -fsSL \
             --retry 3 \
@@ -83,7 +95,7 @@ jobs:
             -o proxies.txt
           echo "Proxy list downloaded. Lines: $(wc -l < proxies.txt)"
         else
-          echo "WEBSHARE_PROXY_LIST_URL is empty, running without Webshare proxy."
+          echo "No proxy list URL configured; use committed proxies.txt (if any) or run without proxy."
         fi
 
     - name: Syntax Check

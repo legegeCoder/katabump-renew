@@ -21,9 +21,10 @@
 - 可选 Telegram 通知
 - 自动上传运行截图 Artifacts
 - Webshare 代理列表自动下载
-- 从 Webshare 10 个代理中随机选择一个出口
+- 自建 http / socks4 / socks5 代理支持（自建入口无需认证或带认证均可）
+- 从代理列表中随机选择出口，失败自动轮换与冷却
 - 自动写入 `HTTP_PROXY` / `HTTPS_PROXY`
-- 代理出口 IP 检查
+- 代理出口预检（http 走 HTTP 请求，socks 走真实 SOCKS 握手）
 - 识别 KataBump “还没到续期时间”的状态
 - 到续期窗口后继续由 Cron 自动重试
 
@@ -65,57 +66,70 @@ Settings → Secrets and variables → Actions → New repository secret
 
 ---
 
-## 🌐 Webshare 代理配置（推荐）
+## 🌐 代理配置（Webshare / 自建 http/socks）
 
-地址：https://www.webshare.io/?referral_code=sfojw2m7nss0
+代理列表有两个来源，二选一即可：
 
-如果 GitHub Actions 的默认出口 IP 不稳定，或者访问 KataBump 时容易触发限制，推荐使用 Webshare 代理列表。
+- **Webshare**：https://www.webshare.io/?referral_code=sfojw2m7nss0 ，配置 `WEBSHARE_PROXY_LIST_URL` Secret。
+- **自建代理（Resin 等）**：配置 `PROXY_LIST_URL` Secret，指向你自己服务上的代理列表下载链接（支持 http / socks4 / socks5）。
 
-当前 workflow 支持下面这个 Secret：
+如果两个 Secret 都没配置，也可以直接把 `proxies.txt` 提交到仓库里（注意别泄露敏感信息）。
 
-### `WEBSHARE_PROXY_LIST_URL` 可选，但推荐
-
-这个值填写 Webshare 的代理列表下载链接。
-
-Webshare 下载出来的代理列表格式一般是：
-
-```text
-IP:PORT:USERNAME:PASSWORD
-```
-
-例如：
-
-```text
-31.59.20.176:6754:username:password
-```
-
-代理输入格式已冻结为以下三种之一：
+### 代理列表支持的行格式
 
 ```text
 HOST:PORT
 HOST:PORT:USERNAME:PASSWORD
 http://USERNAME:PASSWORD@HOST:PORT
+http://HOST:PORT
+socks5://HOST:PORT
+socks5://USERNAME:PASSWORD@HOST:PORT
+socks4://HOST:PORT
 ```
 
-其中 `PORT` 必须是 1 到 65535 的十进制端口。HTTP URL 中的用户名和密码按 URL 编码填写；不带 `http://` 的行只按 Webshare 格式解释，不会猜测为其他语法。路径、查询参数、片段、多余字段以及包含空白、`@` 或反斜杠的主机会被拒绝。
+说明：
+
+- 不带协议前缀的行（`HOST:PORT` / `HOST:PORT:USERNAME:PASSWORD`）按 Webshare 格式解释，一律视为 http 代理。
+- 自建代理请用带协议前缀的 URL 写法；`socks5` / `socks4` 必须显式写协议。
+- `PORT` 必须是 1 到 65535 的十进制端口。URL 中的用户名和密码按 URL 编码填写。
+- 路径、查询参数、片段、多余字段以及包含空白、`@` 或反斜杠的主机会被拒绝；`https://` 和 `socks4` 带认证不支持。
+- ⚠️ Chromium 不支持 SOCKS 用户名/密码认证：`socks5://USER:PASS@HOST:PORT` 可以解析和预检，但浏览器流量不会携带凭据。自建 socks 代理建议改用 IP 白名单或免认证端口；需要认证的代理请使用 http 协议。
+
+### `WEBSHARE_PROXY_LIST_URL` 可选（Webshare）
+
+填写 Webshare 的代理列表下载链接，格式一般是：
+
+```text
+31.59.20.176:6754:username:password
+```
+
+这样 Webshare 后续更换代理 IP 时，通常不需要手动更新 GitHub Secret。
+
+### `PROXY_LIST_URL` 可选（自建代理）
+
+填写你自己服务上代理列表的下载链接，例如：
+
+```text
+socks5://1.2.3.4:1080
+socks5://5.6.7.8:1080
+http://user:pass@9.9.9.9:8080
+```
 
 workflow 会自动执行：
 
 ```text
-下载 Webshare 代理列表
+下载代理列表（PROXY_LIST_URL 或 WEBSHARE_PROXY_LIST_URL）
 ↓
-随机选择一条代理
+解析并校验每行代理（http/socks4/socks5）
 ↓
-转换成 http://USERNAME:PASSWORD@IP:PORT
+随机选择一条可用代理，失败的自动冷却并轮换
 ↓
 写入 HTTP_PROXY / HTTPS_PROXY
 ↓
-运行 action_renew.js
+运行 action_renew.js（http 代理走 HTTP 预检，socks 代理走真实 SOCKS 握手预检）
 ```
 
-这样 Webshare 后续更换代理 IP 时，通常不需要手动更新 GitHub Secret。只要下载链接仍然有效，Actions 每次都会拉取最新代理列表。
-
-> 注意：`WEBSHARE_PROXY_LIST_URL` 里包含下载 token，不要写进代码，不要公开贴到 README、Issue 或日志里，只放到 GitHub Secrets。
+> 注意：两个下载链接 Secret 里可能包含 token，不要写进代码，不要公开贴到 README、Issue 或日志里，只放到 GitHub Secrets。
 
 ---
 
@@ -164,24 +178,33 @@ Run workflow
 
 进入 GitHub Actions 的运行日志，重点看这些步骤：
 
-### 1. Webshare 代理选择
+### 1. 代理选择
 
 正常日志类似：
 
 ```text
-Downloading Webshare proxy list...
+Downloading self-hosted proxy list (http/socks supported)...
 Proxy list downloaded. Lines: 10
-[proxy-runner] 选择代理: HOST:PORT
+[proxy-runner] proxies.txt 共 10 条有效代理
+[proxy-runner] 选择代理: socks5://HOST:PORT
 ```
 
 ### 2. 代理检测
 
-当前流程会使用目标登录地址做预检，再由 Playwright 以原生代理配置启动浏览器：
+当前流程会先用目标登录地址做预检，再由 Playwright 以原生代理配置启动浏览器：
+
+http 代理：
 
 ```text
-[代理] 检测到配置: 服务器=http://HOST:PORT, 认证=是
-[代理] 正在验证代理连接...
+[代理] 检测到配置: 协议=http, 服务器=http://HOST:PORT, 认证=是
 [代理] 目标页面响应：HTTP 200，分类=target_reachable
+```
+
+socks 代理：
+
+```text
+[代理] 检测到配置: 协议=socks5, 服务器=socks5://HOST:PORT, 认证=否
+[代理] SOCKS5 握手成功，代理可用
 ```
 
 预检分类包括 `target_reachable`、`target_server_error`、`proxy_auth_failed`、`upstream_gateway_error` 和 `transport_error`。只有后三者中的代理认证、网关或传输错误会触发代理轮换；普通目标服务器 5xx 不会被错误归因于代理。
@@ -272,6 +295,7 @@ Workflow 是本项目唯一支持的运行方式：Ubuntu、Node.js 24、Xvfb，
 ```text
 USERS_JSON
 KataBump 邮箱密码
+PROXY_LIST_URL
 WEBSHARE_PROXY_LIST_URL
 HTTP_PROXY 完整链接
 代理用户名和密码
@@ -287,19 +311,13 @@ TG_CHAT_ID
 
 ## 🧯 常见问题
 
-### 1. `WEBSHARE_PROXY_LIST_URL is empty`
+### 1. `PROXY_LIST_URL` / `WEBSHARE_PROXY_LIST_URL` 均为空
 
-说明你没有配置 Webshare 下载链接。脚本会不使用 Webshare 代理，继续直连运行。
+说明你没有配置代理列表下载链接。脚本会使用仓库里提交的 `proxies.txt`（如果有），否则直连运行。
 
 ### 2. `Proxy line format invalid`
 
-说明 Webshare 下载到的代理列表不是：
-
-```text
-IP:PORT:USERNAME:PASSWORD
-```
-
-请检查 Webshare 下载链接的格式设置。
+说明下载到的代理列表行不是本文档列出的格式，或使用了不支持的协议（如 `https://`、带认证的 `socks4://`）。请检查代理列表格式设置。
 
 ### 3. `用户处理完成 | 状态: not_ready`
 

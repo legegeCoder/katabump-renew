@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const http = require('http');
+const net = require('net');
 const { spawn } = require('child_process');
 const {
     buildBrowserLaunchOptions,
@@ -92,6 +93,8 @@ process.env.NO_PROXY = 'localhost,127.0.0.1';
 
 const HTTP_PROXY = process.env.HTTP_PROXY;
 const TARGET_LOGIN_URL = 'https://dashboard.katabump.com/auth/login';
+const PROXY_DEFAULT_PORTS = { http: '80', socks4: '1080', socks5: '1080' };
+const PROXY_CHECK_TIMEOUT_MS = 10_000;
 const CHROME_BOOT_TIMEOUT_MIN_MS = 10_000;
 const CHROME_BOOT_TIMEOUT_MAX_MS = 90_000;
 const CHROME_BOOT_TIMEOUT_DEFAULT_MS = 35_000;
@@ -123,17 +126,32 @@ const CHROME_BOOT_TIMEOUT_MS = getChromeBootTimeoutMs(process.env.CHROME_BOOT_TI
 if (HTTP_PROXY) {
     try {
         const proxyUrl = new URL(HTTP_PROXY);
-        const proxyPort = proxyUrl.port || (proxyUrl.protocol === 'http:' ? '80' : '');
+        const scheme = proxyUrl.protocol.replace(/:$/, '').toLowerCase();
+        if (!PROXY_DEFAULT_PORTS[scheme]) {
+            throw new Error(`不支持的代理协议: ${proxyUrl.protocol}（支持 http/socks4/socks5）`);
+        }
+        const proxyPort = proxyUrl.port || PROXY_DEFAULT_PORTS[scheme];
         PROXY_CONFIG = {
-            server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyPort}`,
-            host: proxyUrl.hostname,
+            scheme,
+            server: `${scheme}://${proxyUrl.hostname}:${proxyPort}`,
+            host: proxyUrl.hostname.replace(/^\[|\]$/g, ''),
             port: proxyPort,
             username: proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined,
             password: proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined
         };
-        console.log(`[代理] 检测到配置: 服务器=${PROXY_CONFIG.server}, 认证=${PROXY_CONFIG.username ? '是' : '否'}`);
+        console.log(`[代理] 检测到配置: 协议=${scheme}, 服务器=${PROXY_CONFIG.server}, 认证=${PROXY_CONFIG.username ? '是' : '否'}`);
+        if (scheme.startsWith('socks') && PROXY_CONFIG.username && PROXY_CONFIG.password) {
+            console.warn('[代理] 警告: Chromium 不支持 SOCKS 代理认证，浏览器流量将不带用户名/密码（自建代理建议改用 IP 白名单）');
+        }
+        // SOCKS 代理无法通过 HTTP_PROXY/HTTPS_PROXY 环境变量被 axios 等库使用，
+        // 清理环境变量，避免 Telegram 通知等直连请求被错误路由。
+        if (scheme !== 'http') {
+            for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
+                delete process.env[key];
+            }
+        }
     } catch (e) {
-        console.error('[代理] HTTP_PROXY 格式无效。');
+        console.error('[代理] HTTP_PROXY 格式无效:', e.message);
         PROXY_CONFIG_ERROR = e;
     }
 }
@@ -185,9 +203,185 @@ const INJECTED_SCRIPT = `
 })();
 `;
 
+// --- SOCKS 代理预检：通过真实握手验证代理可用性（无需额外依赖） ---
+function checkSocks5Proxy({ host, port, username, password, targetHost, targetPort, timeoutMs = PROXY_CHECK_TIMEOUT_MS }) {
+    return new Promise((resolve) => {
+        let settled = false;
+        let stage = 'greeting';
+        let buffer = Buffer.alloc(0);
+        const socket = net.connect({ host, port: Number(port) });
+
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            socket.destroy();
+            resolve(result);
+        };
+        const succeed = () => finish({ ok: true, reachable: true, status: null, category: 'target_reachable', error: null });
+        const failTransport = (error, reachable = true) => finish({ ok: false, reachable, status: null, category: 'transport_error', error });
+        const failAuth = (error) => finish({ ok: false, reachable: true, status: null, category: 'proxy_auth_failed', error });
+
+        const sendConnect = () => {
+            const hostBuf = Buffer.from(targetHost, 'utf8');
+            const portNum = Number(targetPort);
+            socket.write(Buffer.concat([
+                Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]),
+                hostBuf,
+                Buffer.from([(portNum >> 8) & 0xff, portNum & 0xff])
+            ]));
+        };
+
+        socket.setTimeout(timeoutMs);
+        socket.on('timeout', () => {
+            socket.destroy();
+            finish({ ok: false, reachable: false, status: null, category: 'transport_error', error: `SOCKS5 代理握手超时 (${timeoutMs}ms)` });
+        });
+        socket.on('error', (error) => {
+            finish({ ok: false, reachable: false, status: null, category: 'transport_error', error: error.message });
+        });
+        socket.on('connect', () => {
+            const methods = username && password ? [0x00, 0x02] : [0x00];
+            socket.write(Buffer.from([0x05, methods.length, ...methods]));
+        });
+        socket.on('data', (chunk) => {
+            buffer = Buffer.concat([buffer, chunk]);
+            for (;;) {
+                if (stage === 'greeting') {
+                    if (buffer.length < 2) return;
+                    if (buffer[0] !== 0x05) return failTransport('SOCKS5 代理响应版本无效');
+                    const method = buffer[1];
+                    buffer = buffer.subarray(2);
+                    if (method === 0x00) {
+                        stage = 'connect';
+                        sendConnect();
+                        continue;
+                    }
+                    if (method === 0x02) {
+                        if (!username || !password) {
+                            return failAuth('SOCKS5 代理要求用户名/密码认证，但未配置凭据');
+                        }
+                        stage = 'auth';
+                        const userBuf = Buffer.from(username, 'utf8');
+                        const passBuf = Buffer.from(password, 'utf8');
+                        socket.write(Buffer.concat([
+                            Buffer.from([0x01, userBuf.length]), userBuf,
+                            Buffer.from([passBuf.length]), passBuf
+                        ]));
+                        continue;
+                    }
+                    return failAuth(method === 0xff
+                        ? 'SOCKS5 代理拒绝所有可用的认证方法'
+                        : `SOCKS5 代理返回未知认证方法 0x${method.toString(16)}`);
+                }
+                if (stage === 'auth') {
+                    if (buffer.length < 2) return;
+                    if (buffer[0] !== 0x01) return failTransport('SOCKS5 认证响应格式无效');
+                    const status = buffer[1];
+                    buffer = buffer.subarray(2);
+                    if (status !== 0x00) {
+                        return failAuth(`SOCKS5 用户名/密码认证失败 (status=${status})`);
+                    }
+                    stage = 'connect';
+                    sendConnect();
+                    continue;
+                }
+                if (stage === 'connect') {
+                    if (buffer.length < 4) return;
+                    if (buffer[0] !== 0x05) return failTransport('SOCKS5 CONNECT 响应版本无效');
+                    const reply = buffer[1];
+                    if (reply !== 0x00) {
+                        const reasons = {
+                            0x01: '一般性失败', 0x02: '规则不允许', 0x03: '网络不可达',
+                            0x04: '主机不可达', 0x05: '连接被拒绝', 0x06: 'TTL 过期',
+                            0x07: '不支持的命令', 0x08: '不支持的地址类型'
+                        };
+                        return failTransport(`SOCKS5 CONNECT 被拒绝: ${reasons[reply] || `code=0x${reply.toString(16)}`}`);
+                    }
+                    return succeed();
+                }
+                return;
+            }
+        });
+    });
+}
+
+function checkSocks4Proxy({ host, port, targetHost, targetPort, timeoutMs = PROXY_CHECK_TIMEOUT_MS }) {
+    return new Promise((resolve) => {
+        let settled = false;
+        let buffer = Buffer.alloc(0);
+        const socket = net.connect({ host, port: Number(port) });
+
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            socket.destroy();
+            resolve(result);
+        };
+        const succeed = () => finish({ ok: true, reachable: true, status: null, category: 'target_reachable', error: null });
+        const failTransport = (error, reachable = true) => finish({ ok: false, reachable, status: null, category: 'transport_error', error });
+
+        socket.setTimeout(timeoutMs);
+        socket.on('timeout', () => {
+            socket.destroy();
+            finish({ ok: false, reachable: false, status: null, category: 'transport_error', error: `SOCKS4 代理握手超时 (${timeoutMs}ms)` });
+        });
+        socket.on('error', (error) => {
+            finish({ ok: false, reachable: false, status: null, category: 'transport_error', error: error.message });
+        });
+        socket.on('connect', () => {
+            // SOCKS4a 请求：端口 + 占位 IP 0.0.0.1 + 空 userid + 域名
+            const hostBuf = Buffer.from(targetHost, 'utf8');
+            const portNum = Number(targetPort);
+            socket.write(Buffer.concat([
+                Buffer.from([0x04, 0x01, (portNum >> 8) & 0xff, portNum & 0xff, 0x00, 0x00, 0x00, 0x01]),
+                Buffer.from([0x00]),
+                hostBuf,
+                Buffer.from([0x00])
+            ]));
+        });
+        socket.on('data', (chunk) => {
+            buffer = Buffer.concat([buffer, chunk]);
+            if (buffer.length < 8) return;
+            if (buffer[0] !== 0x00) return failTransport('SOCKS4 代理响应版本无效');
+            const code = buffer[1];
+            if (code === 0x5a) return succeed();
+            const reasons = { 0x5b: '请求被拒绝或失败', 0x5c: '无法确认 userid', 0x5d: 'userid 不匹配' };
+            return failTransport(`SOCKS4 CONNECT 被拒绝: ${reasons[code] || `code=0x${code.toString(16)}`}`);
+        });
+    });
+}
+
 async function checkProxy() {
     if (!PROXY_CONFIG) return { ok: true, reachable: true, status: null, category: 'no_proxy', error: null };
     console.log('[代理] 正在验证代理连接...');
+
+    // SOCKS 代理：通过真实 SOCKS 握手验证（axios 不支持 SOCKS）
+    if (PROXY_CONFIG.scheme === 'socks5' || PROXY_CONFIG.scheme === 'socks4') {
+        const target = new URL(TARGET_LOGIN_URL);
+        const checker = PROXY_CONFIG.scheme === 'socks5' ? checkSocks5Proxy : checkSocks4Proxy;
+        try {
+            const result = await checker({
+                host: PROXY_CONFIG.host,
+                port: PROXY_CONFIG.port,
+                username: PROXY_CONFIG.username,
+                password: PROXY_CONFIG.password,
+                targetHost: target.hostname,
+                targetPort: target.port || (target.protocol === 'https:' ? '443' : '80')
+            });
+            if (result.ok) {
+                console.log(`[代理] ${PROXY_CONFIG.scheme.toUpperCase()} 握手成功，代理可用`);
+            } else {
+                console.error(`[代理] 预检失败：分类=${result.category}，错误=${result.error || 'none'}`);
+            }
+            return result;
+        } catch (error) {
+            const result = classifyProxyError(error);
+            console.error(`[代理] 预检失败：分类=${result.category}，错误=${result.error || 'none'}`);
+            return result;
+        }
+    }
+
+    // HTTP 代理：axios 直接请求目标页验证
     try {
         const axiosConfig = {
             proxy: {
@@ -195,7 +389,7 @@ async function checkProxy() {
                 host: PROXY_CONFIG.host,
                 port: Number(PROXY_CONFIG.port),
             },
-            timeout: 10000
+            timeout: PROXY_CHECK_TIMEOUT_MS
         };
         if (PROXY_CONFIG.username && PROXY_CONFIG.password) {
             axiosConfig.proxy.auth = {
@@ -218,7 +412,7 @@ async function checkProxy() {
 
 function getAvailableDebugPort() {
     return new Promise((resolve, reject) => {
-        const server = require('net').createServer();
+        const server = net.createServer();
         server.once('error', reject);
         server.listen(0, '127.0.0.1', () => {
             const address = server.address();
@@ -487,7 +681,7 @@ async function prepareCdpAccountPage(browser) {
         }
     }
 
-    if (PROXY_CONFIG && PROXY_CONFIG.username && PROXY_CONFIG.password && typeof context.setHTTPCredentials === 'function') {
+    if (PROXY_CONFIG && PROXY_CONFIG.scheme === 'http' && PROXY_CONFIG.username && PROXY_CONFIG.password && typeof context.setHTTPCredentials === 'function') {
         await context.setHTTPCredentials({
             username: PROXY_CONFIG.username,
             password: PROXY_CONFIG.password

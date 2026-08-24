@@ -17,6 +17,7 @@ function safeRequire() {
 function tests() {
     const mod = safeRequire();
     assert.strictEqual(typeof mod.parseProxyLine, 'function');
+    assert.strictEqual(typeof mod.buildProxyUrl, 'function');
     assert.strictEqual(typeof mod.buildHttpProxy, 'function');
     assert.strictEqual(typeof mod.maskProxyUrl, 'function');
     assert.strictEqual(typeof mod.emitGithubMask, 'function');
@@ -33,11 +34,55 @@ function tests() {
     const samples = [
         {
             line: '1.2.3.4:8080:user:password',
-            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'password', valid: true }
+            expect: { scheme: 'http', ip: '1.2.3.4', port: '8080', username: 'user', password: 'password', valid: true }
         },
         {
             line: 'http://user:pass@1.2.3.4:8080',
-            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'pass', valid: true }
+            expect: { scheme: 'http', ip: '1.2.3.4', port: '8080', username: 'user', password: 'pass', valid: true }
+        },
+        {
+            line: 'http://1.2.3.4:8080',
+            expect: { scheme: 'http', ip: '1.2.3.4', port: '8080', username: '', password: '', valid: true }
+        },
+        {
+            line: 'socks5://1.2.3.4:1080',
+            expect: { scheme: 'socks5', ip: '1.2.3.4', port: '1080', username: '', password: '', valid: true }
+        },
+        {
+            line: 'socks5://user:pass@1.2.3.4:1080',
+            expect: { scheme: 'socks5', ip: '1.2.3.4', port: '1080', username: 'user', password: 'pass', valid: true }
+        },
+        {
+            line: 'SOCKS5://User:Pa%40ss@Proxy.Example.com:1080',
+            expect: { scheme: 'socks5', ip: 'proxy.example.com', port: '1080', username: 'User', password: 'Pa@ss', valid: true }
+        },
+        {
+            line: 'socks4://1.2.3.4:1080',
+            expect: { scheme: 'socks4', ip: '1.2.3.4', port: '1080', username: '', password: '', valid: true }
+        },
+        {
+            line: 'socks4://user:pass@1.2.3.4:1080',
+            expect: { valid: false, reason: 'socks4_auth_unsupported' }
+        },
+        {
+            line: 'https://user:pass@1.2.3.4:8080',
+            expect: { valid: false, reason: 'unsupported_scheme:https' }
+        },
+        {
+            line: 'socks5://1.2.3.4:1080/extra',
+            expect: { valid: false, reason: 'invalid_url_format' }
+        },
+        {
+            line: 'socks5://1.2.3.4:1080?x=1',
+            expect: { valid: false, reason: 'invalid_url_format' }
+        },
+        {
+            line: 'socks5://user@1.2.3.4:1080',
+            expect: { valid: false, reason: 'invalid_url_format' }
+        },
+        {
+            line: 'socks5://host',
+            expect: { valid: false, reason: 'invalid_url_format' }
         },
         {
             line: 'http://user:pass@host:8080:garbage',
@@ -45,19 +90,19 @@ function tests() {
         },
         {
             line: 'http://user:pa%40ss@host:8080',
-            expect: { ip: 'host', port: '8080', username: 'user', password: 'pa@ss', valid: true }
+            expect: { scheme: 'http', ip: 'host', port: '8080', username: 'user', password: 'pa@ss', valid: true }
         },
         {
             line: '1.2.3.4:8080',
-            expect: { ip: '1.2.3.4', port: '8080', username: '', password: '', valid: true }
+            expect: { scheme: 'http', ip: '1.2.3.4', port: '8080', username: '', password: '', valid: true }
         },
         {
             line: 'host:80',
-            expect: { ip: 'host', port: '80', username: '', password: '', valid: true }
+            expect: { scheme: 'http', ip: 'host', port: '80', username: '', password: '', valid: true }
         },
         {
             line: 'Proxy.EXAMPLE.com:8080:user:pass',
-            expect: { ip: 'proxy.example.com', port: '8080', username: 'user', password: 'pass', valid: true }
+            expect: { scheme: 'http', ip: 'proxy.example.com', port: '8080', username: 'user', password: 'pass', valid: true }
         },
         {
             line: '1.2.3.4:0',
@@ -89,7 +134,7 @@ function tests() {
         },
         {
             line: '1.2.3.4:8080:user:pa@ss',
-            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'pa@ss', valid: true }
+            expect: { scheme: 'http', ip: '1.2.3.4', port: '8080', username: 'user', password: 'pa@ss', valid: true }
         },
         {
             line: '',
@@ -113,7 +158,7 @@ function tests() {
         },
         {
             line: 'user1:8080:pass@host:3128',
-            expect: { ip: 'user1', port: '8080', username: 'pass@host', password: '3128', valid: true }
+            expect: { scheme: 'http', ip: 'user1', port: '8080', username: 'pass@host', password: '3128', valid: true }
         },
         {
             line: 'user:pass@host:8080',
@@ -121,7 +166,7 @@ function tests() {
         },
         {
             line: 'proxy:8080:user:pa@ss',
-            expect: { ip: 'proxy', port: '8080', username: 'user', password: 'pa@ss', valid: true }
+            expect: { scheme: 'http', ip: 'proxy', port: '8080', username: 'user', password: 'pa@ss', valid: true }
         },
         {
             line: 'bad host:8080',
@@ -133,11 +178,11 @@ function tests() {
         },
         {
             line: 'bad%host:8080',
-            expect: { ip: 'bad%host', port: '8080', username: '', password: '', valid: true, builds: false }
+            expect: { scheme: 'http', ip: 'bad%host', port: '8080', username: '', password: '', valid: true, builds: false }
         },
         {
             line: '1.2.3.4:8080:user:pa@ss:one:two',
-            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'pa@ss:one:two', valid: true }
+            expect: { scheme: 'http', ip: '1.2.3.4', port: '8080', username: 'user', password: 'pa@ss:one:two', valid: true }
         },
     ];
 
@@ -149,15 +194,17 @@ function tests() {
         assert.strictEqual(parsed.port, sample.expect.port, `port mismatch: ${sample.line}`);
         assert.strictEqual(parsed.username, sample.expect.username, `username mismatch: ${sample.line}`);
         assert.strictEqual(parsed.password, sample.expect.password, `password mismatch: ${sample.line}`);
+        assert.strictEqual(parsed.scheme, sample.expect.scheme, `scheme mismatch: ${sample.line}`);
         if (parsed.valid) {
-            const built = mod.buildHttpProxy(parsed);
+            const scheme = parsed.scheme || 'http';
+            const built = mod.buildProxyUrl(parsed);
             if (sample.expect.builds === false) {
                 assert.strictEqual(built, null, `build should reject: ${sample.line}`);
                 continue;
             }
-            assert.strictEqual(built, `http://${parsed.username ? `${encodeURIComponent(parsed.username)}:${encodeURIComponent(parsed.password)}@` : ''}${parsed.ip}:${parsed.port}`);
-            assert.strictEqual(mod.proxyKey(parsed), `${parsed.ip}:${parsed.port}`);
-            assert.strictEqual(mod.safeProxyId(parsed), `${parsed.ip}:${parsed.port}`);
+            assert.strictEqual(built, `${scheme}://${parsed.username ? `${encodeURIComponent(parsed.username)}:${encodeURIComponent(parsed.password)}@` : ''}${parsed.ip}:${parsed.port}`);
+            assert.strictEqual(mod.proxyKey(parsed), `${scheme}://${parsed.ip}:${parsed.port}`);
+            assert.strictEqual(mod.safeProxyId(parsed), `${scheme}://${parsed.ip}:${parsed.port}`);
         }
     }
 
@@ -168,10 +215,22 @@ function tests() {
     const maskedDefaultPort = mod.maskProxyUrl('http://myuser:mypass@host:80');
     assert.strictEqual(maskedDefaultPort, 'http://***:***@host:80');
 
+    const maskedSocks = mod.maskProxyUrl('socks5://myuser:mypass@1.2.3.4:1080');
+    assert.strictEqual(maskedSocks, 'socks5://***:***@1.2.3.4:1080');
+
+    const maskedSocksDefaultPort = mod.maskProxyUrl('socks5://myuser:mypass@host');
+    assert.strictEqual(maskedSocksDefaultPort, 'socks5://***:***@host:1080');
+
     assert.strictEqual(
-        mod.buildHttpProxy({ valid: true, ip: 'foo@bar', port: '8080', username: '', password: '' }),
+        mod.buildProxyUrl({ valid: true, ip: 'foo@bar', port: '8080', username: '', password: '' }),
         null,
         'host containing @ must not be reinterpreted as URL credentials'
+    );
+
+    assert.strictEqual(
+        mod.buildProxyUrl({ valid: true, scheme: 'socks5', ip: '1.2.3.4', port: '1080', username: 'only-user', password: '' }),
+        null,
+        'partial credentials must be rejected'
     );
 
     const retryAttempt = {
@@ -280,9 +339,9 @@ function tests() {
         mod.parseProxyLine('1.1.1.1:8080:user:pass')
     ];
     const queue = mod.buildProxyCandidateQueue(queueProxies, {
-        '2.2.2.2:8080': { until: Math.floor(Date.now() / 1000) + 3600 }
-    }, new Set(['3.3.3.3:8080']));
-    assert.deepStrictEqual(queue.map(item => mod.proxyKey(item)), ['1.1.1.1:8080']);
+        'http://2.2.2.2:8080': { until: Math.floor(Date.now() / 1000) + 3600 }
+    }, new Set(['http://3.3.3.3:8080']));
+    assert.deepStrictEqual(queue.map(item => mod.proxyKey(item)), ['http://1.1.1.1:8080']);
     assert.strictEqual(mod.getMaxProxyAttempts(10, null), 10);
     assert.strictEqual(mod.getMaxProxyAttempts(10, 4), 4);
 
@@ -297,13 +356,13 @@ function tests() {
         '2026-07-25T04:00:00.000Z'
     );
     const restoredCooldowns = {
-        '4.4.4.4:8080': { until: Math.floor(Date.now() / 1000) + 3600, reason: 'restored' }
+        'http://4.4.4.4:8080': { until: Math.floor(Date.now() / 1000) + 3600, reason: 'restored' }
     };
     const restoredQueue = mod.buildProxyCandidateQueue([
         mod.parseProxyLine('4.4.4.4:8080:user:pass'),
         mod.parseProxyLine('5.5.5.5:8080:user:pass')
     ], restoredCooldowns);
-    assert.deepStrictEqual(restoredQueue.map(item => mod.proxyKey(item)), ['5.5.5.5:8080']);
+    assert.deepStrictEqual(restoredQueue.map(item => mod.proxyKey(item)), ['http://5.5.5.5:8080']);
 
     // 缓存恢复后仍按冷却状态过滤，而不是把已冷却代理重新放回随机池。
     const originalExistsSync = fs.existsSync;
@@ -425,6 +484,16 @@ function tests() {
         assert.ok(cleaned.HTTPS_PROXY.includes('1.2.3.4:8080'));
         assert.ok(cleaned.http_proxy.includes('1.2.3.4:8080'));
         assert.ok(cleaned.https_proxy.includes('1.2.3.4:8080'));
+    }
+
+    // buildChildEnv: socks proxy keeps scheme in env vars
+    {
+        const base = { ...process.env };
+        const cleaned = mod.buildChildEnv(mod.parseProxyLine('socks5://1.2.3.4:1080'), base);
+        assert.strictEqual(cleaned.HTTP_PROXY, 'socks5://1.2.3.4:1080');
+        assert.strictEqual(cleaned.http_proxy, 'socks5://1.2.3.4:1080');
+        assert.strictEqual(cleaned.HTTPS_PROXY, 'socks5://1.2.3.4:1080');
+        assert.strictEqual(cleaned.https_proxy, 'socks5://1.2.3.4:1080');
     }
 
     console.log('[proxy-runner tests] all tests passed');

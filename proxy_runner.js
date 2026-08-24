@@ -280,6 +280,12 @@ function removeExpiredCooldowns(cooldowns) {
 // ============================================================
 //  代理解析（唯一真相源）
 // ============================================================
+const SUPPORTED_PROXY_SCHEMES = {
+    'http:': 'http',
+    'socks4:': 'socks4',
+    'socks5:': 'socks5'
+};
+
 function parseProxyLine(line, lineNumber) {
     const trimmed = (line || '').trim();
     if (!trimmed || trimmed.startsWith('#')) return { valid: false, reason: 'empty_or_comment', lineNumber };
@@ -291,8 +297,8 @@ function parseProxyLine(line, lineNumber) {
         !/[\s/\\?#@\u0000-\u001f\u007f]/.test(s)
     );
 
-    // Format 1: http://USER:PASSWORD@HOST:PORT
-    if (trimmed.startsWith('http://')) {
+    // Format 1: SCHEME://[USER:PASSWORD@]HOST:PORT，支持 http / socks4 / socks5（自建代理常用）
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
         let parsedUrl;
         try {
             parsedUrl = new URL(trimmed);
@@ -300,7 +306,12 @@ function parseProxyLine(line, lineNumber) {
             return { valid: false, reason: 'invalid_url_format', lineNumber };
         }
 
-        // URL format is exactly http://USERNAME:PASSWORD@HOST:PORT.
+        const scheme = SUPPORTED_PROXY_SCHEMES[parsedUrl.protocol];
+        if (!scheme) {
+            return { valid: false, reason: `unsupported_scheme:${parsedUrl.protocol.replace(/:$/, '')}`, lineNumber };
+        }
+
+        // URL format is exactly SCHEME://[USERNAME:PASSWORD@]HOST:PORT.
         // URL accepts paths, queries, and fragments, but none are part of the
         // frozen proxy input format. A trailing extra host field is rejected by
         // URL itself as an invalid port.
@@ -308,37 +319,44 @@ function parseProxyLine(line, lineNumber) {
         const port = (explicitPortMatch && explicitPortMatch[1]) || parsedUrl.port;
 
         if (
-            parsedUrl.protocol !== 'http:' ||
             !parsedUrl.hostname ||
             !port ||
-            parsedUrl.pathname !== '/' ||
+            (parsedUrl.pathname !== '/' && parsedUrl.pathname !== '') ||
             parsedUrl.search ||
             parsedUrl.hash ||
-            !parsedUrl.username ||
-            !parsedUrl.password
+            (Boolean(parsedUrl.username) !== Boolean(parsedUrl.password))
         ) {
             return { valid: false, reason: 'invalid_url_format', lineNumber };
         }
 
-        let username;
-        let password;
-        try {
-            username = decodeURIComponent(parsedUrl.username);
-            password = decodeURIComponent(parsedUrl.password);
-        } catch {
-            return { valid: false, reason: 'invalid_url_encoding', lineNumber };
+        // SOCKS4 协议不支持用户名/密码认证，直接在解析层拒绝。
+        if (scheme === 'socks4' && (parsedUrl.username || parsedUrl.password)) {
+            return { valid: false, reason: 'socks4_auth_unsupported', lineNumber };
         }
 
-        if (!username || !password) {
-            return { valid: false, reason: 'invalid_credentials', lineNumber };
+        let username = '';
+        let password = '';
+        if (parsedUrl.username || parsedUrl.password) {
+            try {
+                username = decodeURIComponent(parsedUrl.username);
+                password = decodeURIComponent(parsedUrl.password);
+            } catch {
+                return { valid: false, reason: 'invalid_url_encoding', lineNumber };
+            }
+
+            if (!username || !password) {
+                return { valid: false, reason: 'invalid_credentials', lineNumber };
+            }
         }
+
         if (!isValidHost(parsedUrl.hostname) || !isValidPort(port)) {
             return { valid: false, reason: 'invalid_url_format', lineNumber };
         }
-        return { valid: true, ip: parsedUrl.hostname, port, username, password, lineNumber };
+        // 非特殊协议（socks5 等）的 hostname 不会被 URL 自动转小写，这里统一归一化
+        return { valid: true, scheme, ip: parsedUrl.hostname.toLowerCase(), port, username, password, lineNumber };
     }
 
-    // Format 2: HOST:PORT or HOST:PORT:USER:PASSWORD (Webshare standard)
+    // Format 2: HOST:PORT or HOST:PORT:USER:PASSWORD (Webshare standard, 均视为 http 代理)
     const colonParts = trimmed.split(':');
 
     if (colonParts.length === 2) {
@@ -348,7 +366,7 @@ function parseProxyLine(line, lineNumber) {
         if (!isValidHost(ip)) return { valid: false, reason: 'invalid_host', lineNumber };
         if (!port) return { valid: false, reason: 'empty_port', lineNumber };
         if (!isValidPort(port)) return { valid: false, reason: `invalid_port:${port}`, lineNumber };
-        return { valid: true, ip: ip.toLowerCase(), port, username: '', password: '', lineNumber };
+        return { valid: true, scheme: 'http', ip: ip.toLowerCase(), port, username: '', password: '', lineNumber };
     }
 
     if (colonParts.length >= 4) {
@@ -361,22 +379,31 @@ function parseProxyLine(line, lineNumber) {
         if (!port) return { valid: false, reason: 'empty_port', lineNumber };
         if (!isValidPort(port)) return { valid: false, reason: `invalid_port:${port}`, lineNumber };
         if (!username || !password) return { valid: false, reason: 'invalid_credentials', lineNumber };
-        return { valid: true, ip: ip.toLowerCase(), port, username, password, lineNumber };
+        return { valid: true, scheme: 'http', ip: ip.toLowerCase(), port, username, password, lineNumber };
     }
 
     return { valid: false, reason: `invalid_field_count:${colonParts.length}`, lineNumber };
 }
 
-function buildHttpProxy(parsed) {
+const PROXY_DEFAULT_PORTS = {
+    http: '80',
+    socks4: '1080',
+    socks5: '1080'
+};
+
+function buildProxyUrl(parsed) {
     if (!parsed || !parsed.valid || !parsed.ip || !parsed.port) return null;
+    const scheme = parsed.scheme || 'http';
+    if (!PROXY_DEFAULT_PORTS[scheme]) return null;
     if ((parsed.username && !parsed.password) || (!parsed.username && parsed.password)) return null;
+    if (scheme === 'socks4' && (parsed.username || parsed.password)) return null;
     if (/[\s/\\?#@\u0000-\u001f\u007f]/.test(parsed.ip)) return null;
     const encodedUser = parsed.username ? encodeURIComponent(parsed.username) : '';
     const encodedPass = parsed.password ? encodeURIComponent(parsed.password) : '';
     const auth = [encodedUser, encodedPass].filter(Boolean).join(':');
     const urlStr = auth
-        ? `http://${auth}@${parsed.ip}:${parsed.port}`
-        : `http://${parsed.ip}:${parsed.port}`;
+        ? `${scheme}://${auth}@${parsed.ip}:${parsed.port}`
+        : `${scheme}://${parsed.ip}:${parsed.port}`;
     try {
         const u = new URL(urlStr);
         let decodedUser = '';
@@ -387,9 +414,9 @@ function buildHttpProxy(parsed) {
         } catch {
             return null;
         }
-        const effectivePort = u.port || (u.protocol === 'http:' ? '80' : '');
+        const effectivePort = u.port || PROXY_DEFAULT_PORTS[scheme];
         if (
-            u.protocol !== 'http:' ||
+            u.protocol !== `${scheme}:` ||
             u.hostname !== parsed.ip ||
             effectivePort !== String(parsed.port) ||
             Boolean(u.username) !== Boolean(parsed.username) ||
@@ -407,7 +434,8 @@ function buildHttpProxy(parsed) {
 }
 
 function proxyKey(parsed) {
-    return `${parsed.ip}:${parsed.port}`;
+    const scheme = (parsed && parsed.scheme) || 'http';
+    return `${scheme}://${parsed.ip}:${parsed.port}`;
 }
 
 function buildChildEnv(parsed, baseEnv) {
@@ -419,7 +447,7 @@ function buildChildEnv(parsed, baseEnv) {
         delete env.https_proxy;
         return env;
     }
-    const proxyUrl = buildHttpProxy(parsed);
+    const proxyUrl = buildProxyUrl(parsed);
     if (!proxyUrl) {
         return null;
     }
@@ -433,7 +461,7 @@ function buildChildEnv(parsed, baseEnv) {
 function maskProxyUrl(proxyUrl) {
     try {
         const u = new URL(proxyUrl);
-        const port = u.port || (u.protocol === 'http:' ? '80' : '');
+        const port = u.port || PROXY_DEFAULT_PORTS[(u.protocol || '').replace(/:$/, '')] || '';
         if (u.username || u.password) {
             return `${u.protocol}//***:***@${u.hostname}:${port}`;
         }
@@ -451,7 +479,7 @@ function emitGithubMask(proxyUrl, env = process.env, logger = console.log) {
 
 function safeProxyId(parsed) {
     if (!parsed || !parsed.valid) return 'invalid';
-    return `${parsed.ip}:${parsed.port}`;
+    return `${parsed.scheme || 'http'}://${parsed.ip}:${parsed.port}`;
 }
 
 // ============================================================
@@ -475,7 +503,7 @@ function loadProxies() {
     const invalid = [];
     for (const { trimmed, lineNumber } of nonEmptyLines) {
         const parsed = parseProxyLine(trimmed, lineNumber);
-        if (parsed.valid && buildHttpProxy(parsed)) {
+        if (parsed.valid && buildProxyUrl(parsed)) {
             valid.push(parsed);
         } else {
             if (parsed.valid) parsed.reason = 'invalid_proxy_url';
@@ -544,9 +572,12 @@ async function runActionRenew(parsed, attempt = 1) {
         console.log('[proxy-runner] 无代理模式，已清除 HTTP_PROXY / HTTPS_PROXY');
     } else {
         console.log(`[proxy-runner] 设置 HTTP_PROXY=${safeProxyId(parsed)}`);
-        const proxyUrl = buildHttpProxy(parsed);
+        const proxyUrl = buildProxyUrl(parsed);
         console.log(`[proxy-runner] 代理地址: ${maskProxyUrl(proxyUrl)}`);
         emitGithubMask(proxyUrl);
+        if (parsed.scheme === 'socks5' && parsed.username && parsed.password) {
+            console.warn('[proxy-runner] 警告: Chromium 不支持 SOCKS 代理认证，浏览器流量将不带用户名/密码（建议自建代理改用 IP 白名单）');
+        }
     }
 
     const scriptPath = path.join(process.cwd(), 'action_renew.js');
@@ -750,7 +781,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename
 
 module.exports = {
     parseProxyLine,
-    buildHttpProxy,
+    buildProxyUrl,
+    buildHttpProxy: buildProxyUrl,
     buildChildEnv,
     maskProxyUrl,
     emitGithubMask,
