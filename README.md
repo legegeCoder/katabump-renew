@@ -130,7 +130,7 @@ workflow 会自动执行：
 ↓
 写入 HTTP_PROXY / HTTPS_PROXY
 ↓
-运行 action_renew.js（http 代理走 HTTP 预检，socks 代理走真实 SOCKS 握手预检）
+运行 action_renew.js（http 代理走 CONNECT 隧道预检，socks 代理走真实 SOCKS 握手预检）
 ```
 
 代理行格式完整列表（`PROXY_URL` 与 `proxies.txt` 每行通用）：
@@ -215,7 +215,7 @@ http 代理：
 
 ```text
 [代理] 检测到配置: 协议=http, 服务器=http://HOST:PORT, 认证=是
-[代理] 目标页面响应：HTTP 200，分类=target_reachable
+[代理] CONNECT 隧道建立，目标响应：HTTP 200，分类=target_reachable
 ```
 
 socks 代理：

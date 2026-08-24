@@ -7,6 +7,7 @@ const path = require('path');
 const os = require('os');
 const http = require('http');
 const net = require('net');
+const tls = require('tls');
 const { spawn } = require('child_process');
 const {
     buildBrowserLaunchOptions,
@@ -353,6 +354,108 @@ function checkSocks4Proxy({ host, port, targetHost, targetPort, timeoutMs = PROX
     });
 }
 
+// --- HTTP 代理预检：与 Chrome 一致，通过 CONNECT 隧道验证（axios 对 https-over-http-proxy 支持不完整，
+//     且跟随重定向通 Cloudflare 站点时可能超过 maxRedirects 误报失败） ---
+function checkHttpProxyTunnel({ host, port, username, password, targetUrl, timeoutMs = PROXY_CHECK_TIMEOUT_MS, tlsOptions = {} }) {
+    return new Promise((resolve) => {
+        const target = new URL(targetUrl);
+        const targetIsHttps = target.protocol === 'https:';
+        const targetPort = target.port || (targetIsHttps ? '443' : '80');
+        const requestPath = `${target.pathname || '/'}${target.search || ''}`;
+
+        let settled = false;
+        let stage = 'connect'; // connect → tls → request
+        let buffer = Buffer.alloc(0);
+        let tlsSocket = null;
+        const socket = net.connect({ host, port: Number(port) });
+
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            try { if (tlsSocket) tlsSocket.destroy(); else socket.destroy(); } catch { }
+            resolve(result);
+        };
+        const failTransport = (error, reachable = true) =>
+            finish({ ok: false, reachable, status: null, category: 'transport_error', error });
+
+        const onData = (chunk) => {
+            if (stage !== 'connect') return;
+            buffer = Buffer.concat([buffer, chunk]);
+            const headerEnd = buffer.indexOf('\r\n\r\n');
+            if (headerEnd < 0) {
+                if (buffer.length > 16 * 1024) failTransport('HTTP 代理 CONNECT 响应过大');
+                return;
+            }
+            const statusLine = buffer.subarray(0, headerEnd).toString('utf8').split('\r\n')[0] || '';
+            const statusMatch = statusLine.match(/^HTTP\/[\d.]+\s+(\d{3})/i);
+            if (!statusMatch) return failTransport(`HTTP 代理 CONNECT 响应格式无效: ${statusLine.slice(0, 120)}`);
+            const status = Number(statusMatch[1]);
+            if (status === 407) {
+                return finish({ ok: false, reachable: true, status, category: 'proxy_auth_failed', error: 'Proxy authentication required (407)' });
+            }
+            if (status < 200 || status >= 300) {
+                const category = [502, 503, 504].includes(status) ? 'upstream_gateway_error' : 'transport_error';
+                return finish({ ok: false, reachable: true, status, category, error: `代理 CONNECT 失败: HTTP ${status}` });
+            }
+
+            // CONNECT 隧道建立成功。https 目标继续做 TLS + 单次请求验证；
+            // http 目标隧道已通即认为代理可用（不再降级为绝对形式 GET）。
+            if (!targetIsHttps) {
+                return finish({ ok: true, reachable: true, status, category: 'target_reachable', error: null });
+            }
+            socket.removeListener('data', onData);
+            stage = 'tls';
+            tlsSocket = tls.connect({ socket, servername: target.hostname, ...tlsOptions }, () => {
+                stage = 'request';
+                tlsSocket.write(
+                    `GET ${requestPath} HTTP/1.1\r\n` +
+                    `Host: ${target.hostname}\r\n` +
+                    `User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n` +
+                    `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n` +
+                    `Accept-Language: en-US,en;q=0.9\r\n` +
+                    `Connection: close\r\n\r\n`
+                );
+            });
+            tlsSocket.on('error', (error) => failTransport(`TLS 握手失败: ${error.message}`));
+            tlsSocket.on('close', () => {
+                if (!settled && stage === 'request') failTransport('目标连接在响应前关闭');
+            });
+            tlsSocket.on('data', (responseChunk) => {
+                if (stage !== 'request') return;
+                const text = responseChunk.toString('utf8');
+                const responseMatch = text.match(/^HTTP\/[\d.]+\s+(\d{3})/i);
+                if (!responseMatch) return failTransport(`目标响应格式无效: ${text.slice(0, 120)}`);
+                // 只取首个状态码判定，不跟随重定向（避免重定向循环误报）
+                const status = Number(responseMatch[1]);
+                const result = classifyProxyResponse(status);
+                finish({ ...result, reachable: true });
+            });
+        };
+
+        socket.setTimeout(timeoutMs);
+        socket.on('timeout', () => {
+            socket.destroy();
+            finish({ ok: false, reachable: false, status: null, category: 'transport_error', error: `HTTP 代理 CONNECT 超时 (${timeoutMs}ms)` });
+        });
+        socket.on('error', (error) => {
+            finish({ ok: false, reachable: false, status: null, category: 'transport_error', error: error.message });
+        });
+        socket.on('connect', () => {
+            const proxyAuth = username && password
+                ? `Proxy-Authorization: Basic ${Buffer.from(`${username}:${password}`, 'utf8').toString('base64')}\r\n`
+                : '';
+            socket.write(
+                `CONNECT ${target.hostname}:${targetPort} HTTP/1.1\r\n` +
+                `Host: ${target.hostname}:${targetPort}\r\n` +
+                proxyAuth +
+                `Proxy-Connection: keep-alive\r\n` +
+                `\r\n`
+            );
+        });
+        socket.on('data', onData);
+    });
+}
+
 async function checkProxy() {
     if (!PROXY_CONFIG) return { ok: true, reachable: true, status: null, category: 'no_proxy', error: null };
     console.log('[代理] 正在验证代理连接...');
@@ -383,30 +486,23 @@ async function checkProxy() {
         }
     }
 
-    // HTTP 代理：axios 直接请求目标页验证
+    // HTTP 代理：与 Chrome 一致，通过 CONNECT 隧道验证（含 Proxy-Auth 认证与目标 HTTPS 响应检查）
     try {
-        const axiosConfig = {
-            proxy: {
-                protocol: 'http',
-                host: PROXY_CONFIG.host,
-                port: Number(PROXY_CONFIG.port),
-            },
-            timeout: PROXY_CHECK_TIMEOUT_MS
-        };
-        if (PROXY_CONFIG.username && PROXY_CONFIG.password) {
-            axiosConfig.proxy.auth = {
-                username: PROXY_CONFIG.username,
-                password: PROXY_CONFIG.password
-            };
+        const result = await checkHttpProxyTunnel({
+            host: PROXY_CONFIG.host,
+            port: PROXY_CONFIG.port,
+            username: PROXY_CONFIG.username,
+            password: PROXY_CONFIG.password,
+            targetUrl: TARGET_LOGIN_URL
+        });
+        if (result.ok) {
+            console.log(`[代理] CONNECT 隧道建立，目标响应：HTTP ${result.status}，分类=${result.category}`);
+        } else {
+            console.error(`[代理] 预检失败：分类=${result.category}，错误=${result.error || 'none'}`);
         }
-        const response = await axios.get(TARGET_LOGIN_URL, axiosConfig);
-        const result = classifyProxyResponse(response.status);
-        console.log(`[代理] 目标页面响应：HTTP ${response.status}，分类=${result.category}`);
         return result;
     } catch (error) {
-        const result = error.response && error.response.status
-            ? classifyProxyResponse(error.response.status)
-            : classifyProxyError(error);
+        const result = classifyProxyError(error);
         console.error(`[代理] 预检失败：分类=${result.category}，错误=${result.error || 'none'}`);
         return result;
     }
