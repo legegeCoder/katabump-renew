@@ -1627,6 +1627,25 @@ async function getLocatorText(locator) {
     }
 }
 
+/** 收集页面上可见 link/button 的文本（用于导航失败时的诊断日志） */
+async function dumpClickableTexts(page, limit = 40) {
+    try {
+        const items = await page.locator('a, button').all();
+        const texts = [];
+        for (const item of items) {
+            if (texts.length >= limit) break;
+            try {
+                if (!(await item.isVisible())) continue;
+                const text = (await item.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+                if (text) texts.push(text.slice(0, 40));
+            } catch (e) { }
+        }
+        return texts;
+    } catch (e) {
+        return [];
+    }
+}
+
 /** 保存截图 + HTML 快照 */
 async function dumpDebugSnapshot(page, name) {
     const photoDir = await ensureScreenshotsDir();
@@ -2275,14 +2294,49 @@ async function runMain() {
                     }
                 }
 
-                // 如果有 See 按钮，点击它；否则认为已在 dashboard 页面
+                // 如果有 See 按钮，点击它进入服务器详情页；否则认为已在 dashboard 页面。
+                // 注意：Locator.isVisible() 立即返回不接受 timeout，必须用 waitFor 真正等待 SPA 渲染。
                 try {
-                    const seeBtn = page.getByRole('link', { name: 'See' }).first();
-                    if (await seeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-                        await seeBtn.click();
-                        console.log('[登录] 已点击 See 按钮。');
+                    const beforeUrl = page.url();
+                    // 首个候选等 15s 覆盖 SPA 渲染延迟；后续候选降级匹配，各等 3s
+                    const seeCandidates = [
+                        { locator: page.getByRole('link', { name: 'See', exact: true }).first(), timeout: 15000 },
+                        { locator: page.getByRole('button', { name: 'See', exact: true }).first(), timeout: 3000 },
+                        { locator: page.getByRole('link', { name: /^see$/i }).first(), timeout: 3000 },
+                        { locator: page.getByRole('button', { name: /^see$/i }).first(), timeout: 3000 },
+                        { locator: page.locator('a:has-text("See"), button:has-text("See")').first(), timeout: 3000 }
+                    ];
+                    let seeClicked = false;
+                    for (const candidate of seeCandidates) {
+                        try {
+                            await candidate.locator.waitFor({ state: 'visible', timeout: candidate.timeout });
+                            await candidate.locator.click();
+                            console.log('[登录] 已点击 See 按钮，进入服务器详情页...');
+                            seeClicked = true;
+                            break;
+                        } catch (e) { }
                     }
-                } catch (e) { }
+                    if (seeClicked) {
+                        // 等待详情页就绪：URL 变化或 Renew 按钮出现（任一先到）
+                        try {
+                            await Promise.race([
+                                page.waitForURL(url => String(url) !== beforeUrl, { timeout: 20000 }),
+                                page.getByRole('button', { name: 'Renew', exact: true }).first()
+                                    .waitFor({ state: 'visible', timeout: 20000 })
+                            ]);
+                        } catch (e) { }
+                        await page.waitForLoadState('domcontentloaded').catch(() => { });
+                        console.log(`[登录] 详情页当前 URL: ${page.url()}`);
+                    } else {
+                        console.log('[登录] 未找到可见的 See 按钮，停留在当前页面寻找 Renew。');
+                        const clickable = await dumpClickableTexts(page);
+                        console.log(`[登录诊断] 当前页面可点击元素: ${JSON.stringify(clickable)}`);
+                        const photoDir = await ensureScreenshotsDir();
+                        await page.screenshot({ path: path.join(photoDir, `no_see_button_${accountLabel}.png`), fullPage: true });
+                    }
+                } catch (e) {
+                    console.log(`[登录] See 按钮处理异常: ${e.message}`);
+                }
             }
 
             // 3. Renew 主循环
@@ -2293,7 +2347,21 @@ async function runMain() {
                     try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { }
 
                     if (!(await renewBtn.isVisible().catch(() => false))) {
+                        // 页面可能仍在加载（刚点完 See 跳转详情页），先重试几次再放弃
+                        if (attempt <= 2) {
+                            console.log(`未找到 Renew 按钮，页面可能仍在加载， ${(attempt)}s 后重试...`);
+                            await new Promise(resolve => setTimeout(resolve, attempt * 3000));
+                            continue;
+                        }
                         console.log('未找到 Renew 按钮 (可能已结束)。');
+                        const clickable = await dumpClickableTexts(page);
+                        console.log(`[Renew诊断] 未找到 Renew 按钮时的可点击元素: ${JSON.stringify(clickable)}`);
+                        const photoDir = await ensureScreenshotsDir();
+                        await page.screenshot({ path: path.join(photoDir, `no_renew_button_${accountLabel}.png`), fullPage: true });
+                        try {
+                            const html = await page.content();
+                            fs.writeFileSync(path.join(photoDir, `no_renew_button_${accountLabel}.html`), html, 'utf-8');
+                        } catch (e) { }
                         break;
                     }
 
