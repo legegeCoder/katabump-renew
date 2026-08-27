@@ -1697,21 +1697,38 @@ function detectCaptchaRequired(text) {
 /** 检测 ALTCHA checkbox 实际是否已勾选
  *  返回 true = 已勾选/已解决，false = 未勾选/未解决 */
 async function isAltchaCheckboxChecked(page, modal) {
-    // 策略 0（最可靠）: evaluate 穿透 altcha-widget 的 open shadow DOM ——
-    // 检查 checkbox.checked 或隐藏 token 输入框（name=altcha）已拿到 PoW 结果
+    // 策略 0（最可靠）: evaluate 检查 widget 状态 —— getState()==='verified' /
+    // data-state="verified" / checkbox.checked / 隐藏 token 输入框已有 PoW 结果。
+    // v2/v3 的 UI 渲染在 light DOM（无 shadow root），同时兼容 shadow DOM。
+    // 优先在 modal 范围内查找，找不到再全局兑底（浮层模式可能挂在 body 上）。
     try {
-        const verified = await page.evaluate(() => {
-            const widgets = document.querySelectorAll('altcha-widget, [data-altcha]');
-            for (const w of widgets) {
-                const sr = w.shadowRoot;
-                if (!sr) continue;
-                const cb = sr.querySelector('input[type="checkbox"]');
+        const modalHandle = await modal.elementHandle().catch(() => null);
+        const verified = await page.evaluate((modalEl) => {
+            const checkRoot = (root) => {
+                if (!root || !root.querySelector) return false;
+                const d = root.querySelector('.altcha[data-state], [data-state]');
+                if (d && d.getAttribute('data-state') === 'verified') return true;
+                const cb = root.querySelector('input[type="checkbox"]');
                 if (cb && cb.checked) return true;
-                const token = sr.querySelector('input[name="altcha"], input[type="hidden"]');
+                const token = root.querySelector('input[name="altcha"], input[type="hidden"]');
                 if (token && token.value && token.value.length > 10) return true;
+                return false;
+            };
+            const checkWidget = (w) => {
+                if (typeof w.getState === 'function') {
+                    try { if (String(w.getState()) === 'verified') return true; } catch (e) { } }
+                return checkRoot(w.shadowRoot) || checkRoot(w);
+            };
+            const scope = modalEl || document;
+            let widgets = scope.querySelectorAll('altcha-widget, [data-altcha]');
+            if (!widgets || widgets.length === 0) {
+                widgets = document.querySelectorAll('altcha-widget, [data-altcha]');
+            }
+            for (const w of widgets) {
+                if (checkWidget(w)) return true;
             }
             return false;
-        });
+        }, modalHandle);
         if (verified) return true;
     } catch (e) { }
 
@@ -1822,28 +1839,56 @@ async function readExpiryDate(page) {
 }
 
 /**
- * ALTCHA 与 CF Turnstile 的本质差异：ALTCHA 是 Web Component，checkbox 藏在
- * <altcha-widget> 的 open Shadow DOM 里（无 iframe）；且 shadow DOM 是弹窗后异步渲染的
- * （web component 升级 + JS 加载 + challenge 拉取），必须先 waitFor 再点。
- * Playwright CSS 选择器可穿透 open shadow DOM，故 altcha-widget input[type=checkbox] 直接可用。
+ * ALTCHA 与 CF Turnstile 的本质差异：ALTCHA 是 Web Component（无 iframe），
+ * UI 渲染在 light DOM（v2/v3 均已读源码确认，无 shadow root），且弹窗后异步初始化
+ * （web component 升级 + challenge 拉取），必须先 waitFor 再操作。
+ * 另外ALTCHA 是 PoW 工作量证明而非人机识别：点击 checkbox 本质只是触发
+ * widget 的 verify() 方法（拉取 challenge → 计算 → 填充 token），
+ * 因此对隐藏/浮层（floating）模式的 widget，直接程序调用 verify() 与人工点击等价。
  */
 async function tryClickAltchaCheckbox(page, modal, { renderTimeoutMs = 10000, verifyTimeoutMs = 12000 } = {}) {
-    // 0) 等待 ALTCHA widget 的 shadow DOM 渲染出 checkbox（弹窗刚打开时组件常未初始化完）
+    // 0) 等待 ALTCHA widget 渲染出 checkbox（弹窗刚打开时组件常未初始化完）
     const shadowCb = modal.locator('altcha-widget input[type="checkbox"], [data-altcha] input[type="checkbox"]').first();
     try {
         await shadowCb.waitFor({ state: 'attached', timeout: renderTimeoutMs });
-        console.log('[ALTCHA] shadow DOM 内 checkbox 已渲染。');
+        console.log('[ALTCHA] widget 内 checkbox 已渲染。');
     } catch (e) {
         const visibleCount = await modal.locator('input[type="checkbox"]').count().catch(() => 0);
-        console.log(`[ALTCHA] 等待 ${renderTimeoutMs}ms 未见 shadow checkbox（modal 内可见 checkbox 数=${visibleCount}），继续尝试降级策略。`);
+        console.log(`[ALTCHA] 等待 ${renderTimeoutMs}ms 未见 checkbox（modal 内 checkbox 数=${visibleCount}），继续尝试降级策略。`);
     }
 
     const widgetLocators = [
         modal.locator('altcha-widget, [data-altcha], .altcha').first()
     ];
 
-    // 逐策略尝试：每个策略点击后轮询验证状态（ALTCHA PoW 计算需 1-3 秒，不能点完立刻查）
+    // 逐策略尝试：每个策略触发后轮询验证状态（PoW 计算需 1-3 秒，不能点完立刻查）
     const strategies = [
+        {
+            // 策略 0（对隐藏/浮层 widget 唯一有效）：直接调用 widget.verify()。
+            // 点击 checkbox 本质就是触发 verify()，程序调用与人工点击等价，
+            // 且不受 widget 可见性影响（浮层模式下 widget 可能 display:none）。
+            name: 'programmatic-verify',
+            pollMs: verifyTimeoutMs + 8000,
+            run: async () => {
+                try {
+                    return await page.evaluate(() => {
+                        const widgets = document.querySelectorAll('altcha-widget, [data-altcha]');
+                        for (const w of widgets) {
+                            if (typeof w.verify === 'function') {
+                                try {
+                                    const result = w.verify();
+                                    if (result && typeof result.catch === 'function') result.catch(() => { });
+                                    return true;
+                                } catch (e) { continue; }
+                            }
+                        }
+                        return false;
+                    });
+                } catch (e) {
+                    return false;
+                }
+            }
+        },
         {
             name: 'shadow-checkbox-direct',
             loc: () => shadowCb,
@@ -1862,14 +1907,15 @@ async function tryClickAltchaCheckbox(page, modal, { renderTimeoutMs = 10000, ve
         {
             name: 'programmatic-shadow-click',
             run: async () => {
-                // evaluate 内直接对 shadow checkbox 调 .click()（不依赖坐标，适配各种布局）
+                // evaluate 内直接对 checkbox 调 .click()（不依赖坐标，light/shadow DOM 都查）
                 const clicked = await page.evaluate(() => {
                     const widgets = document.querySelectorAll('altcha-widget, [data-altcha]');
                     for (const w of widgets) {
-                        const sr = w.shadowRoot;
-                        if (!sr) continue;
-                        const cb = sr.querySelector('input[type="checkbox"]');
-                        if (cb) { cb.click(); return true; }
+                        const roots = [w.shadowRoot, w].filter(Boolean);
+                        for (const root of roots) {
+                            const cb = root.querySelector('input[type="checkbox"]');
+                            if (cb) { cb.click(); return true; }
+                        }
                     }
                     return false;
                 });
@@ -1897,7 +1943,7 @@ async function tryClickAltchaCheckbox(page, modal, { renderTimeoutMs = 10000, ve
                 await loc.waitFor({ state: 'attached', timeout: 3000 }).catch(() => { });
                 const box = await loc.boundingBox().catch(() => null);
                 if (!box || box.width < 3 || box.height < 3) {
-                    console.log(`[ALTCHA] 策略 ${strategy.name}: 目标无有效 box，跳过。`);
+                    console.log(`[ALTCHA] 策略 ${strategy.name}: 目标无有效 box（不可见/未渲染），跳过。`);
                     continue;
                 }
                 await loc.click({ force: strategy.force, timeout: 5000 });
@@ -1907,18 +1953,19 @@ async function tryClickAltchaCheckbox(page, modal, { renderTimeoutMs = 10000, ve
                 console.log(`[ALTCHA] 策略 ${strategy.name}: 未能触发，下一个。`);
                 continue;
             }
-            console.log(`[ALTCHA] 策略 ${strategy.name} 已触发，轮询验证状态（最多 ${verifyTimeoutMs}ms）...`);
+            const pollMs = strategy.pollMs || verifyTimeoutMs;
+            console.log(`[ALTCHA] 策略 ${strategy.name} 已触发，轮询验证状态（最多 ${pollMs}ms）...`);
 
-            // 轮询等待 PoW 完成后 checkbox 变为 checked
+            // 轮询等待 PoW 完成后 checkbox 变为 checked / 状态变 verified
             const pollStart = Date.now();
-            while (Date.now() - pollStart < verifyTimeoutMs) {
+            while (Date.now() - pollStart < pollMs) {
                 await page.waitForTimeout(1000);
                 if (await isAltchaCheckboxChecked(page, modal)) {
                     console.log(`[ALTCHA] ✅ 策略 ${strategy.name} 验证通过（耗时 ${Date.now() - pollStart}ms）。`);
                     return true;
                 }
             }
-            console.log(`[ALTCHA] 策略 ${strategy.name} 触发后 ${verifyTimeoutMs}ms 内未验证通过，尝试下一策略。`);
+            console.log(`[ALTCHA] 策略 ${strategy.name} 触发后 ${pollMs}ms 内未验证通过，尝试下一策略。`);
         } catch (e) {
             console.log(`[ALTCHA] 策略 ${strategy.name} 异常: ${e.message}`);
         }
