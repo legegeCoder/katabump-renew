@@ -1784,6 +1784,35 @@ function detectRenewSuccess(text) {
     return false;
 }
 
+/**
+ * 关闭 Renew 模态框（点 Close / Escape），等待 Bootstrap fade 完成。
+ * 用于重试前清理：modal 未关时外层 Renew 按钮会被遮罩拦截点击，
+ * 曾导致 60s actionability 超时死锁。
+ */
+async function dismissRenewModal(page) {
+    try {
+        const closeBtn = page.locator('.modal.show [data-bs-dismiss="modal"], #renew-modal [data-bs-dismiss="modal"], .modal.show .btn-close, .modal.show .modal-header button').first();
+        const clicked = await closeBtn.click({ timeout: 3000 }).then(() => true).catch(() => false);
+        if (!clicked) {
+            await page.keyboard.press('Escape').catch(() => { });
+        }
+        // 等 Bootstrap fade-out（默认 150ms，留足余量）+ backdrop 移除
+        await page.waitForTimeout(1500);
+        const stillOpen = await page.locator('.modal.show').count().catch(() => 0);
+        if (stillOpen > 0) {
+            // 兑底：直接移除遮罩与 show 类（Bootstrap 正常路径不会走到这里）
+            await page.evaluate(() => {
+                document.querySelectorAll('.modal-backdrop').forEach(el => el.remove());
+                document.querySelectorAll('.modal.show').forEach(el => el.classList.remove('show'));
+                document.body.classList.remove('modal-open');
+                document.body.style.removeProperty('overflow');
+                document.body.style.removeProperty('padding-right');
+            }).catch(() => { });
+            await page.waitForTimeout(500);
+        }
+    } catch (e) { }
+}
+
 // ============================================================
 //  Renew 弹窗定位（多策略 fallback）
 // ============================================================
@@ -2512,39 +2541,52 @@ async function runMain() {
             // 3. Renew 主循环
             if (!stopCurrentUser && !shouldStopAllUsers) {
                 for (let attempt = 1; attempt <= 20; attempt++) {
-                    const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
+                    // 0) 若 modal 已打开（上一轮 confirm 未就绪重试），直接复用，
+                    //    不再点击外层按钮——modal 开着时外层按钮会被遮罩拦截，
+                    //    曾导致 60s actionability 超时死锁。
+                    let modal = await findRenewModal(page);
 
-                    try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { }
+                    if (!modal) {
+                        const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
 
-                    if (!(await renewBtn.isVisible().catch(() => false))) {
-                        // 页面可能仍在加载（刚点完 See 跳转详情页），先重试几次再放弃
-                        if (attempt <= 2) {
-                            console.log(`未找到 Renew 按钮，页面可能仍在加载， ${(attempt)}s 后重试...`);
-                            await new Promise(resolve => setTimeout(resolve, attempt * 3000));
+                        try { await renewBtn.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) { }
+
+                        if (!(await renewBtn.isVisible().catch(() => false))) {
+                            // 页面可能仍在加载（刚点完 See 跳转详情页），先重试几次再放弃
+                            if (attempt <= 2) {
+                                console.log(`未找到 Renew 按钮，页面可能仍在加载， ${(attempt)}s 后重试...`);
+                                await new Promise(resolve => setTimeout(resolve, attempt * 3000));
+                                continue;
+                            }
+                            console.log('未找到 Renew 按钮 (可能已结束)。');
+                            const clickable = await dumpClickableTexts(page);
+                            console.log(`[Renew诊断] 未找到 Renew 按钮时的可点击元素: ${JSON.stringify(clickable)}`);
+                            const photoDir = await ensureScreenshotsDir();
+                            await page.screenshot({ path: path.join(photoDir, `no_renew_button_${accountLabel}.png`), fullPage: true });
+                            try {
+                                const html = await page.content();
+                                fs.writeFileSync(path.join(photoDir, `no_renew_button_${accountLabel}.html`), html, 'utf-8');
+                            } catch (e) { }
+                            break;
+                        }
+
+                        // 【保留】外层 Renew 点击（加超时，被遮挡时关掉 modal 后重试）
+                        try {
+                            await renewBtn.click({ timeout: 15000 });
+                        } catch (clickError) {
+                            console.log(`[Renew] 外层按钮点击失败（可能被 modal 遮挡）: ${String(clickError.message).split('\n')[0]}`);
+                            await dismissRenewModal(page);
                             continue;
                         }
-                        console.log('未找到 Renew 按钮 (可能已结束)。');
-                        const clickable = await dumpClickableTexts(page);
-                        console.log(`[Renew诊断] 未找到 Renew 按钮时的可点击元素: ${JSON.stringify(clickable)}`);
-                        const photoDir = await ensureScreenshotsDir();
-                        await page.screenshot({ path: path.join(photoDir, `no_renew_button_${accountLabel}.png`), fullPage: true });
-                        try {
-                            const html = await page.content();
-                            fs.writeFileSync(path.join(photoDir, `no_renew_button_${accountLabel}.html`), html, 'utf-8');
-                        } catch (e) { }
-                        break;
-                    }
+                        console.log('Renew 按钮已点击。等待模态框...');
 
-                    // 【保留】外层 Renew 点击
-                    await renewBtn.click();
-                    console.log('Renew 按钮已点击。等待模态框...');
-
-                    const modal = await findRenewModal(page);
-                    if (!modal) {
-                        console.log('模态框未出现？重试中...');
-                        const photoDir = await ensureScreenshotsDir();
-                        await page.screenshot({ path: path.join(photoDir, `renew_modal_not_found_${attempt}.png`), fullPage: true });
-                        continue;
+                        modal = await findRenewModal(page);
+                        if (!modal) {
+                            console.log('模态框未出现？重试中...');
+                            const photoDir = await ensureScreenshotsDir();
+                            await page.screenshot({ path: path.join(photoDir, `renew_modal_not_found_${attempt}.png`), fullPage: true });
+                            continue;
+                        }
                     }
                     console.log('Renew 模态框已识别。');
 
@@ -2649,15 +2691,27 @@ async function runMain() {
                         }
                     }
 
-                    // 点击确认 Renew 按钮
-                    const confirmBtn = modal.getByRole('button', { name: 'Renew' });
-                    if (!(await confirmBtn.isVisible().catch(() => false))) {
-                        console.log('确认 Renew 按钮不可见，刷新重试。');
+                    // 点击确认 Renew 按钮（modal 内确认按钮；ALTCHA 验证通过后才可能显示/启用，
+                    // 用 waitFor 等待而非一次性 isVisible，避免误判；.last() 取 footer 内确认按钮）
+                    const confirmBtn = modal.getByRole('button', { name: 'Renew' }).last();
+                    let confirmReady = false;
+                    try {
+                        await confirmBtn.waitFor({ state: 'visible', timeout: 10000 });
+                        confirmReady = true;
+                    } catch (e) { }
+                    if (!confirmReady) {
+                        console.log('确认 Renew 按钮不可见，关闭模态框后重试。');
+                        await dismissRenewModal(page);
                         continue;
                     }
 
                     console.log('   >> 点击确认 Renew 按钮...');
-                    await confirmBtn.click();
+                    try {
+                        await confirmBtn.click({ timeout: 10000 });
+                    } catch (confirmClickError) {
+                        console.log(`确认按钮点击被拦截，尝试 force 点击: ${String(confirmClickError.message).split('\n')[0]}`);
+                        await confirmBtn.click({ force: true, timeout: 5000 }).catch(() => { });
+                    }
                     console.log('Confirm Renew clicked.');
 
                     // 点击后等待响应
@@ -2725,9 +2779,13 @@ async function runMain() {
 
                             // Checkbox 已勾选且无原生错误 → 尝试再次点击 confirm
                             console.log('   >> ✅ Checkbox 验证通过，再次点击确认 Renew...');
-                            const confirmBtnAfterCb = modal.getByRole('button', { name: 'Renew' });
+                            const confirmBtnAfterCb = modal.getByRole('button', { name: 'Renew' }).last();
                             if (await confirmBtnAfterCb.isVisible().catch(() => false)) {
-                                await confirmBtnAfterCb.click();
+                                try {
+                                    await confirmBtnAfterCb.click({ timeout: 10000 });
+                                } catch (e2) {
+                                    await confirmBtnAfterCb.click({ force: true, timeout: 5000 }).catch(() => { });
+                                }
                                 console.log('Confirm Renew clicked (after captcha).');
                                 await page.waitForTimeout(3000);
 
