@@ -1697,7 +1697,25 @@ function detectCaptchaRequired(text) {
 /** 检测 ALTCHA checkbox 实际是否已勾选
  *  返回 true = 已勾选/已解决，false = 未勾选/未解决 */
 async function isAltchaCheckboxChecked(page, modal) {
-    // 策略 1: 查 modal 内是否有 checked 的 checkbox
+    // 策略 0（最可靠）: evaluate 穿透 altcha-widget 的 open shadow DOM ——
+    // 检查 checkbox.checked 或隐藏 token 输入框（name=altcha）已拿到 PoW 结果
+    try {
+        const verified = await page.evaluate(() => {
+            const widgets = document.querySelectorAll('altcha-widget, [data-altcha]');
+            for (const w of widgets) {
+                const sr = w.shadowRoot;
+                if (!sr) continue;
+                const cb = sr.querySelector('input[type="checkbox"]');
+                if (cb && cb.checked) return true;
+                const token = sr.querySelector('input[name="altcha"], input[type="hidden"]');
+                if (token && token.value && token.value.length > 10) return true;
+            }
+            return false;
+        });
+        if (verified) return true;
+    } catch (e) { }
+
+    // 策略 1: 查 modal 内是否有 checked 的 checkbox（Playwright CSS 可穿透 open shadow DOM）
     try {
         const checked = await modal.locator('input[type="checkbox"]:checked').count();
         if (checked > 0) return true;
@@ -1801,6 +1819,111 @@ async function readExpiryDate(page) {
         console.error(`[Expiry] 读取失败: ${e.message}`);
     }
     return null;
+}
+
+/**
+ * ALTCHA 与 CF Turnstile 的本质差异：ALTCHA 是 Web Component，checkbox 藏在
+ * <altcha-widget> 的 open Shadow DOM 里（无 iframe）；且 shadow DOM 是弹窗后异步渲染的
+ * （web component 升级 + JS 加载 + challenge 拉取），必须先 waitFor 再点。
+ * Playwright CSS 选择器可穿透 open shadow DOM，故 altcha-widget input[type=checkbox] 直接可用。
+ */
+async function tryClickAltchaCheckbox(page, modal, { renderTimeoutMs = 10000, verifyTimeoutMs = 12000 } = {}) {
+    // 0) 等待 ALTCHA widget 的 shadow DOM 渲染出 checkbox（弹窗刚打开时组件常未初始化完）
+    const shadowCb = modal.locator('altcha-widget input[type="checkbox"], [data-altcha] input[type="checkbox"]').first();
+    try {
+        await shadowCb.waitFor({ state: 'attached', timeout: renderTimeoutMs });
+        console.log('[ALTCHA] shadow DOM 内 checkbox 已渲染。');
+    } catch (e) {
+        const visibleCount = await modal.locator('input[type="checkbox"]').count().catch(() => 0);
+        console.log(`[ALTCHA] 等待 ${renderTimeoutMs}ms 未见 shadow checkbox（modal 内可见 checkbox 数=${visibleCount}），继续尝试降级策略。`);
+    }
+
+    const widgetLocators = [
+        modal.locator('altcha-widget, [data-altcha], .altcha').first()
+    ];
+
+    // 逐策略尝试：每个策略点击后轮询验证状态（ALTCHA PoW 计算需 1-3 秒，不能点完立刻查）
+    const strategies = [
+        {
+            name: 'shadow-checkbox-direct',
+            loc: () => shadowCb,
+            force: true
+        },
+        {
+            name: 'shadow-checkbox-box',
+            loc: () => modal.locator('altcha-widget .altcha-checkbox, altcha-widget label').first(),
+            force: true
+        },
+        {
+            name: 'widget-host-click',
+            loc: () => widgetLocators[0],
+            force: false
+        },
+        {
+            name: 'programmatic-shadow-click',
+            run: async () => {
+                // evaluate 内直接对 shadow checkbox 调 .click()（不依赖坐标，适配各种布局）
+                const clicked = await page.evaluate(() => {
+                    const widgets = document.querySelectorAll('altcha-widget, [data-altcha]');
+                    for (const w of widgets) {
+                        const sr = w.shadowRoot;
+                        if (!sr) continue;
+                        const cb = sr.querySelector('input[type="checkbox"]');
+                        if (cb) { cb.click(); return true; }
+                    }
+                    return false;
+                });
+                return clicked;
+            }
+        },
+        {
+            name: 'cdp-host-center',
+            run: async () => {
+                // CDP 真实输入事件点击 widget 中心（isTrusted=true，最接近人手）
+                const box = await widgetLocators[0].boundingBox().catch(() => null);
+                if (!box || box.width < 5 || box.height < 5) return false;
+                return await cdpClickAt(page, box.x + Math.min(box.width / 2, 30), box.y + box.height / 2, 'altcha-widget-center');
+            }
+        }
+    ];
+
+    for (const strategy of strategies) {
+        try {
+            let fired = false;
+            if (strategy.run) {
+                fired = await strategy.run();
+            } else {
+                const loc = strategy.loc();
+                await loc.waitFor({ state: 'attached', timeout: 3000 }).catch(() => { });
+                const box = await loc.boundingBox().catch(() => null);
+                if (!box || box.width < 3 || box.height < 3) {
+                    console.log(`[ALTCHA] 策略 ${strategy.name}: 目标无有效 box，跳过。`);
+                    continue;
+                }
+                await loc.click({ force: strategy.force, timeout: 5000 });
+                fired = true;
+            }
+            if (!fired) {
+                console.log(`[ALTCHA] 策略 ${strategy.name}: 未能触发，下一个。`);
+                continue;
+            }
+            console.log(`[ALTCHA] 策略 ${strategy.name} 已触发，轮询验证状态（最多 ${verifyTimeoutMs}ms）...`);
+
+            // 轮询等待 PoW 完成后 checkbox 变为 checked
+            const pollStart = Date.now();
+            while (Date.now() - pollStart < verifyTimeoutMs) {
+                await page.waitForTimeout(1000);
+                if (await isAltchaCheckboxChecked(page, modal)) {
+                    console.log(`[ALTCHA] ✅ 策略 ${strategy.name} 验证通过（耗时 ${Date.now() - pollStart}ms）。`);
+                    return true;
+                }
+            }
+            console.log(`[ALTCHA] 策略 ${strategy.name} 触发后 ${verifyTimeoutMs}ms 内未验证通过，尝试下一策略。`);
+        } catch (e) {
+            console.log(`[ALTCHA] 策略 ${strategy.name} 异常: ${e.message}`);
+        }
+    }
+    return false;
 }
 
 // ============================================================
@@ -2437,12 +2560,23 @@ async function runMain() {
                         console.log(`[ALTCHA] checkbox checked before click: ${cbCheckedBefore}`);
 
                         if (!cbCheckedBefore) {
-                            console.log('[ALTCHA] trying click strategy: auto');
-                            const cbClicked = await tryClickCaptchaCheckbox(page, modal);
+                            console.log('[ALTCHA] trying click strategy: altcha-first (shadow DOM aware)');
+                            // ALTCHA 专用策略：等待 shadow DOM 渲染 + 多策略点击 + PoW 完成轮询
+                            let cbClicked = await tryClickAltchaCheckbox(page, modal);
+                            if (!cbClicked) {
+                                // 降级：旧的通用 Turnstile/iframe 策略（万一页面结构变化）
+                                console.log('[ALTCHA] 专用策略未成功，降级到通用 captcha 点击策略。');
+                                cbClicked = await tryClickCaptchaCheckbox(page, modal);
+                            }
                             if (cbClicked) {
-                                console.log('[ALTCHA] 自动点击完成，等待 3 秒验证...');
-                                await page.waitForTimeout(3000);
-                                const cbCheckedAfter = await isAltchaCheckboxChecked(page, modal);
+                                console.log('[ALTCHA] 自动点击完成，最终确认验证状态（轮询最多 15s）...');
+                                // 再轮询一次确认（点击函数内部已轮询过，这里是最终确认）
+                                let cbCheckedAfter = false;
+                                const confirmStart = Date.now();
+                                while (Date.now() - confirmStart < 15000) {
+                                    if (await isAltchaCheckboxChecked(page, modal)) { cbCheckedAfter = true; break; }
+                                    await page.waitForTimeout(1500);
+                                }
                                 console.log(`[ALTCHA] checkbox checked after click: ${cbCheckedAfter}`);
                                 if (!cbCheckedAfter) {
                                     console.log('[ALTCHA] 点击后 checkbox 仍未勾选，标记 captcha_required。');
