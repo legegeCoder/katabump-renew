@@ -2002,6 +2002,30 @@ async function tryClickAltchaCheckbox(page, modal, { renderTimeoutMs = 10000, ve
     return false;
 }
 
+/**
+ * 定位 Renew modal 内的确认按钮（多状态兼容）。
+ * 关键：按钮文本会随 ALTCHA 验证状态变化——初始为 "Renew"，验证中变为
+ * "Verifying... N%"（KataBump 监听 altcha 进度事件更新按钮文案），
+ * 因此不能只按 name="Renew" 精确匹配，需多策略 + 结构兑底。
+ */
+async function findRenewConfirmButton(modal) {
+    const candidates = [
+        modal.getByRole('button', { name: 'Renew', exact: true }).last(),
+        modal.locator('button:has-text("Verifying")').last(),
+        modal.locator('button[type="submit"]').last(),
+        modal.locator('.modal-footer button:not([data-bs-dismiss="modal"]), .modal-footer button:not(.btn-secondary)').last(),
+        modal.getByRole('button', { name: /renew|verifying|submit|confirm/i }).last()
+    ];
+    for (const candidate of candidates) {
+        try {
+            if (await candidate.isVisible().catch(() => false)) {
+                return candidate;
+            }
+        } catch (e) { }
+    }
+    return null;
+}
+
 // ============================================================
 //  尝试点击 ALTCHA / Turnstile checkbox（弹窗内）
 // ============================================================
@@ -2540,6 +2564,7 @@ async function runMain() {
 
             // 3. Renew 主循环
             if (!stopCurrentUser && !shouldStopAllUsers) {
+                let confirmNotVisibleCount = 0; // 连续未找到确认按钮的次数（熔断用）
                 for (let attempt = 1; attempt <= 20; attempt++) {
                     // 0) 若 modal 已打开（上一轮 confirm 未就绪重试），直接复用，
                     //    不再点击外层按钮——modal 开着时外层按钮会被遮罩拦截，
@@ -2691,28 +2716,68 @@ async function runMain() {
                         }
                     }
 
-                    // 点击确认 Renew 按钮（modal 内确认按钮；ALTCHA 验证通过后才可能显示/启用，
-                    // 用 waitFor 等待而非一次性 isVisible，避免误判；.last() 取 footer 内确认按钮）
-                    const confirmBtn = modal.getByRole('button', { name: 'Renew' }).last();
-                    let confirmReady = false;
-                    try {
-                        await confirmBtn.waitFor({ state: 'visible', timeout: 10000 });
-                        confirmReady = true;
-                    } catch (e) { }
-                    if (!confirmReady) {
-                        console.log('确认 Renew 按钮不可见，关闭模态框后重试。');
+                    // 点击确认 Renew 按钮（文本会随验证状态变化：Renew → Verifying... N%，
+                    // 用多策略定位；Verifying 状态先等待完成再点）
+                    let confirmBtn = await findRenewConfirmButton(modal);
+                    if (!confirmBtn) {
+                        // 按钮可能还没渲染，等一下再找
+                        try {
+                            await modal.locator('button').last().waitFor({ state: 'visible', timeout: 5000 });
+                        } catch (e) { }
+                        confirmBtn = await findRenewConfirmButton(modal);
+                    }
+
+                    if (confirmBtn) {
+                        confirmNotVisibleCount = 0; // 找到按钮，重置熔断计数
+                        // 若按钮处于 Verifying 状态，等它完成（最多 15s）
+                        let btnText = (await confirmBtn.innerText().catch(() => '')).trim();
+                        if (/verifying/i.test(btnText)) {
+                            console.log(`[Confirm] 按钮处于验证中状态（"${btnText}"），等待完成...`);
+                            const verifyWaitStart = Date.now();
+                            while (Date.now() - verifyWaitStart < 15000) {
+                                await page.waitForTimeout(1500);
+                                btnText = (await confirmBtn.innerText().catch(() => '')).trim();
+                                if (!/verifying/i.test(btnText)) {
+                                    console.log(`[Confirm] 验证中状态结束（耗时 ${Date.now() - verifyWaitStart}ms，当前文本 "${btnText}"）。`);
+                                    break;
+                                }
+                                // 100% 且持续不变时也可以尝试点击
+                                if (/100%/.test(btnText) && Date.now() - verifyWaitStart > 8000) {
+                                    console.log('[Confirm] Verifying 卡在 100%，尝试直接点击。');
+                                    break;
+                                }
+                            }
+                        }
+
+                        const btnEnabled = await confirmBtn.isEnabled().catch(() => true);
+                        console.log(`   >> 点击确认按钮（文本 "${btnText}"，enabled=${btnEnabled}）...`);
+                        try {
+                            await confirmBtn.click({ timeout: 10000 });
+                        } catch (confirmClickError) {
+                            console.log(`确认按钮点击被拦截，尝试 force 点击: ${String(confirmClickError.message).split('\n')[0]}`);
+                            await confirmBtn.click({ force: true, timeout: 5000 }).catch(() => { });
+                        }
+                        console.log('Confirm Renew clicked.');
+                    } else {
+                        confirmNotVisibleCount++;
+                        console.log(`确认按钮不可见（连续第 ${confirmNotVisibleCount} 次）。`);
+                        // 熔断：ALTCHA 已验证但按钮始终找不到，重开 modal 无意义，
+                        // 直接诊断退出（避免 20 轮无效循环）
+                        if (confirmNotVisibleCount >= 3) {
+                            console.log('>> 连续多次未找到确认按钮，停止重试并保存诊断。');
+                            const clickable = await dumpClickableTexts(page);
+                            console.log(`[Confirm诊断] modal 内可点击元素: ${JSON.stringify(clickable)}`);
+                            const modalButtons = await modal.locator('button').allInnerTexts().catch(() => []);
+                            console.log(`[Confirm诊断] modal 全部按钮文本: ${JSON.stringify(modalButtons)}`);
+                            await dumpDebugSnapshot(page, `no_confirm_button_${accountLabel}`);
+                            runStatus = 'error';
+                            blockMessage = 'Renew confirm button not found after ALTCHA verification';
+                            renewSuccess = false;
+                            break;
+                        }
                         await dismissRenewModal(page);
                         continue;
                     }
-
-                    console.log('   >> 点击确认 Renew 按钮...');
-                    try {
-                        await confirmBtn.click({ timeout: 10000 });
-                    } catch (confirmClickError) {
-                        console.log(`确认按钮点击被拦截，尝试 force 点击: ${String(confirmClickError.message).split('\n')[0]}`);
-                        await confirmBtn.click({ force: true, timeout: 5000 }).catch(() => { });
-                    }
-                    console.log('Confirm Renew clicked.');
 
                     // 点击后等待响应
                     await page.waitForTimeout(2000);
@@ -2779,8 +2844,8 @@ async function runMain() {
 
                             // Checkbox 已勾选且无原生错误 → 尝试再次点击 confirm
                             console.log('   >> ✅ Checkbox 验证通过，再次点击确认 Renew...');
-                            const confirmBtnAfterCb = modal.getByRole('button', { name: 'Renew' }).last();
-                            if (await confirmBtnAfterCb.isVisible().catch(() => false)) {
+                            const confirmBtnAfterCb = await findRenewConfirmButton(modal);
+                            if (confirmBtnAfterCb) {
                                 try {
                                     await confirmBtnAfterCb.click({ timeout: 10000 });
                                 } catch (e2) {
