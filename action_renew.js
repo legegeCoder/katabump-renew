@@ -2750,12 +2750,46 @@ async function runMain() {
                         }
 
                         const btnEnabled = await confirmBtn.isEnabled().catch(() => true);
+                        // 按钮被禁用（站点把按钮卡在 Verifying 状态未恢复）：
+                        // 禁用的表单控件会吞掉一切点击事件（含 force click 与 CDP 真实输入，
+                        // HTML 规范行为），必须先用 JS 启用才能点击。
+                        if (!btnEnabled) {
+                            console.log('[Confirm] 按钮被禁用（Verifying 卡死状态），JS 启用后重试点击...');
+                            await page.evaluate(() => {
+                                const modalEl = document.querySelector('.modal.show, #renew-modal');
+                                if (modalEl) {
+                                    modalEl.querySelectorAll('button').forEach(b => {
+                                        if (b.disabled && !/close|cancel|dismiss/i.test(b.textContent || '')) {
+                                            b.disabled = false;
+                                        }
+                                    });
+                                }
+                            }).catch(() => { });
+                        }
                         console.log(`   >> 点击确认按钮（文本 "${btnText}"，enabled=${btnEnabled}）...`);
+                        let confirmClicked = false;
                         try {
-                            await confirmBtn.click({ timeout: 10000 });
+                            await confirmBtn.click({ timeout: 8000 });
+                            confirmClicked = true;
                         } catch (confirmClickError) {
-                            console.log(`确认按钮点击被拦截，尝试 force 点击: ${String(confirmClickError.message).split('\n')[0]}`);
-                            await confirmBtn.click({ force: true, timeout: 5000 }).catch(() => { });
+                            console.log(`确认按钮点击失败: ${String(confirmClickError.message).split('\n')[0]}`);
+                        }
+                        // 兜底：直接触发表单提交（requestSubmit 绕过按钮 disabled 状态；
+                        // 站点若在 form 上绑定 submit 监听即可生效——此时 csrf + altcha
+                        // token + checkbox 均已就绪，表单数据完整）
+                        if (!confirmClicked) {
+                            console.log('[Confirm] 尝试直接提交表单 (form.requestSubmit)...');
+                            await page.evaluate(() => {
+                                const modalEl = document.querySelector('.modal.show, #renew-modal');
+                                const form = modalEl && (modalEl.querySelector('form') || (modalEl.matches('form') ? modalEl : null));
+                                if (form) {
+                                    try { form.requestSubmit(); }
+                                    catch (e) {
+                                        try { form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true })); }
+                                        catch (e2) { }
+                                    }
+                                }
+                            }).catch(() => { });
                         }
                         console.log('Confirm Renew clicked.');
                     } else {
@@ -2969,6 +3003,74 @@ async function runMain() {
                         const photoDir = await ensureScreenshotsDir();
                         await dumpDebugSnapshot(page, `not_ready_in_modal_${attempt}`);
                         break;
+                    }
+
+                    // 补救：ALTCHA token 已就绪但 modal 未关 —— 表单可能未被真正提交
+                    // （按钮曾处于禁用状态，点击事件被吞）。启用按钮 + 重点击 + requestSubmit 兜底。
+                    try {
+                        const rescue = await page.evaluate(() => {
+                            const modalEl = document.querySelector('.modal.show, #renew-modal');
+                            if (!modalEl) return { tokenReady: false };
+                            const token = modalEl.querySelector('input[name="altcha"]');
+                            if (!token || !token.value || token.value.length < 10) return { tokenReady: false };
+                            modalEl.querySelectorAll('button').forEach(b => {
+                                if (b.disabled && !/close|cancel|dismiss/i.test(b.textContent || '')) b.disabled = false;
+                            });
+                            return { tokenReady: true };
+                        });
+                        if (rescue && rescue.tokenReady) {
+                            console.log('   >> [补救] ALTCHA token 已就绪，启用按钮并重新提交...');
+                            const rescueBtn = await findRenewConfirmButton(modal);
+                            if (rescueBtn) {
+                                await rescueBtn.click({ timeout: 5000 }).catch(() => { });
+                            }
+                            await page.waitForTimeout(2500);
+                            let rescueClosed = !(await modal.isVisible().catch(() => false));
+                            if (!rescueClosed) {
+                                console.log('   >> [补救] 按钮重点击未生效，直接提交表单 (requestSubmit)...');
+                                await page.evaluate(() => {
+                                    const modalEl = document.querySelector('.modal.show, #renew-modal');
+                                    const form = modalEl && (modalEl.querySelector('form') || (modalEl.matches('form') ? modalEl : null));
+                                    if (form) {
+                                        try { form.requestSubmit(); }
+                                        catch (e) {
+                                            try { form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true })); }
+                                            catch (e2) { }
+                                        }
+                                    }
+                                }).catch(() => { });
+                                await page.waitForTimeout(3000);
+                                rescueClosed = !(await modal.isVisible().catch(() => false));
+                            }
+                            if (rescueClosed) {
+                                console.log('   >> [补救] 提交成功，modal 已关闭。');
+                                const rescueExpiry = await readExpiryDate(page);
+                                console.log(`[Expiry] 补救提交后 Expiry: ${rescueExpiry || '未读取到'}`);
+                                if (rescueExpiry && oldExpiry && rescueExpiry !== oldExpiry) {
+                                    console.log(`   >> ✅ Expiry 已变化: ${oldExpiry} → ${rescueExpiry}，续期成功（补救路径）！`);
+                                    runStatus = 'success';
+                                    renewSuccess = true;
+                                    await page.screenshot({ path: path.join(await ensureScreenshotsDir(), `renew_success_${attempt}.png`), fullPage: true });
+                                    break;
+                                }
+                                // modal 已关但 Expiry 未变/未读到 → 继续下方正常判定（not_ready 等）
+                                const rescueText = await getPageText(page);
+                                const rescueNotReady = detectNotReady(rescueText);
+                                if (rescueNotReady) {
+                                    runStatus = 'not_ready';
+                                    blockMessage = typeof rescueNotReady === 'string' ? rescueNotReady : rescueNotReady.raw;
+                                    renewSuccess = false;
+                                    await dumpDebugSnapshot(page, `not_ready_rescue_${attempt}`);
+                                    break;
+                                }
+                                runStatus = 'already_renewed';
+                                renewSuccess = false;
+                                blockMessage = 'Modal closed after rescue submit but expiry unchanged';
+                                break;
+                            }
+                        }
+                    } catch (rescueError) {
+                        console.log(`   >> [补救] 异常: ${rescueError.message}`);
                     }
 
                     // 未知状态 — 记录详细诊断信息，不盲目刷新
