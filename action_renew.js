@@ -13,8 +13,8 @@ const {
     buildBrowserLaunchOptions,
     classifyProxyResponse,
     classifyProxyError,
-    extractChromeNetErrorCode,
     isProxyLevelNavigationError,
+    isNavigationTimeoutError,
     mergeExitCode,
     validateUsersConfig,
     safeAccountLabel,
@@ -460,13 +460,13 @@ function checkHttpProxyTunnel({ host, port, username, password, targetUrl, timeo
 
 // 首跳/刷新遇到代理层网络错误时原地重试一次：代理池网关每次 CONNECT 都会重新选节点，
 // 瞬时黑洞节点大概率被绕过，比整个流程重启（外层换代理重跑）便宜得多。
+// 覆盖两类症状：net::ERR_* 连接层故障，以及"已导航但响应流中断"的导航超时。
 async function withTunnelRetry(action, description) {
     try {
         return await action();
     } catch (error) {
-        if (!isProxyLevelNavigationError(error)) throw error;
-        const netCode = extractChromeNetErrorCode(error.message);
-        console.error(`[导航] ${description} 遇到代理/网络层错误 ${netCode}，2s 后经新隧道重试一次...`);
+        if (!isProxyLevelNavigationError(error) && !isNavigationTimeoutError(error)) throw error;
+        console.error(`[导航] ${description} 遇到代理/网络层错误（${error.message.split('\n')[0]}），2s 后经新隧道重试一次...`);
         await new Promise(resolve => setTimeout(resolve, 2000));
         return await action();
     }
@@ -3186,13 +3186,13 @@ async function runMain() {
             if (hasConclusiveStatus) {
                 // 已得到明确业务结果（success / not_ready / login_failed 等），收尾阶段的异常不推翻该结果
                 console.error(`   >> ⚠️ 已有明确结果 (runStatus=${runStatus})，收尾异常不覆盖: ${err.message}`);
-            } else if (PROXY_CONFIG && isProxyLevelNavigationError(err)) {
+            } else if (PROXY_CONFIG && (isProxyLevelNavigationError(err) || isNavigationTimeoutError(err))) {
                 // 预检 CONNECT 成功不代表网关分到的节点可用（隧道能建、数据不通），
-                // 导航阶段的网络层故障应交由外层换节点重试，而非终止整轮
-                const netCode = extractChromeNetErrorCode(err.message);
-                console.error(`   >> ⚠️ 判定为代理层网络错误 (${netCode})，标记 PROXY_RETRY 交由外层换节点重试`);
+                // 导航阶段的网络层故障应交由外层换节点重试，而非终止整轮。
+                // 覆盖两种症状：net::ERR_* 连接层故障；已导航但响应流中断的导航超时。
+                console.error('   >> ⚠️ 判定为代理层网络故障，标记 PROXY_RETRY 交由外层换节点重试');
                 runStatus = 'proxy_retry';
-                blockMessage = `代理层网络错误 (${netCode}): ${err.message}`;
+                blockMessage = `代理层网络故障: ${err.message.split('\n')[0]}`;
             } else {
                 runStatus = 'error';
                 blockMessage = err.message;

@@ -6,6 +6,7 @@ const {
     classifyProxyError,
     extractChromeNetErrorCode,
     isProxyLevelNavigationError,
+    isNavigationTimeoutError,
     mergeExitCode,
     validateUsersConfig,
     safeAccountLabel,
@@ -96,6 +97,26 @@ async function tests() {
     assert.strictEqual(isProxyLevelNavigationError(new Error('Timeout 60000ms exceeded.')), false);
     assert.strictEqual(isProxyLevelNavigationError('net::ERR_TUNNEL_CONNECTION_FAILED: boom'), true);
     assert.strictEqual(isProxyLevelNavigationError({ message: 'net::ERR_PROXY_CONNECTION_FAILED' }), true);
+
+    // 导航超时（goto/reload 已发出但 domcontentloaded 未达成）→ 代理层故障
+    const navTimeout = new Error([
+        'page.reload: Timeout 60000ms exceeded.',
+        'Call log:',
+        '  - waiting for navigation until "domcontentloaded"',
+        '    - navigated to "https://dashboard.katabump.com/auth/login"'
+    ].join('\n'));
+    assert.strictEqual(isNavigationTimeoutError(navTimeout), true);
+    assert.strictEqual(
+        isNavigationTimeoutError(new Error('page.goto: Timeout 60000ms exceeded.\nCall log:\n  - navigating to "https://x.example", waiting until "domcontentloaded"')),
+        true
+    );
+    // 非导航 API 的超时不归类（无法区分网络故障与业务未跳转/未渲染）
+    assert.strictEqual(isNavigationTimeoutError(new Error('page.waitForURL: Timeout 20000ms exceeded.')), false);
+    assert.strictEqual(isNavigationTimeoutError(new Error('locator.click: Timeout 5000ms exceeded.')), false);
+    assert.strictEqual(isNavigationTimeoutError(new Error('page.goto: net::ERR_TIMED_OUT at https://x.example')), false);
+    assert.strictEqual(isNavigationTimeoutError(null), false);
+    assert.strictEqual(isNavigationTimeoutError({}), false);
+    assert.strictEqual(isNavigationTimeoutError('page.reload: Timeout 60000ms exceeded.'), false);
 
     assert.strictEqual(validateUsersConfig(undefined).fatal, true);
     assert.strictEqual(validateUsersConfig('not-json').fatal, true);
