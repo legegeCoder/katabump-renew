@@ -13,6 +13,8 @@ const {
     buildBrowserLaunchOptions,
     classifyProxyResponse,
     classifyProxyError,
+    extractChromeNetErrorCode,
+    isProxyLevelNavigationError,
     mergeExitCode,
     validateUsersConfig,
     safeAccountLabel,
@@ -27,7 +29,7 @@ const RESULT_FILE = process.env.KATABUMP_RESULT_FILE || '';
 const EXIT_CODE = {
     SUCCESS: 0,
     FATAL: 1,
-    PROXY_RETRY: 42,      // Turnstile 3次仍失败 → 外层换代理，不与其他退出码冲突
+    PROXY_RETRY: 42,      // Turnstile 3次仍失败 / 代理层网络错误（net::ERR_TIMED_OUT 等） → 外层换代理重试
     RENEW_CAPTCHA_FAILED: 43, // Renew ALTCHA 失败，不换代理但也不返回成功
     NOT_READY: 3,         // 还没到续期窗口
     ALREADY_RENEWED: 4,   // Expiry 未变化，本轮已是最新
@@ -454,6 +456,20 @@ function checkHttpProxyTunnel({ host, port, username, password, targetUrl, timeo
         });
         socket.on('data', onData);
     });
+}
+
+// 首跳/刷新遇到代理层网络错误时原地重试一次：代理池网关每次 CONNECT 都会重新选节点，
+// 瞬时黑洞节点大概率被绕过，比整个流程重启（外层换代理重跑）便宜得多。
+async function withTunnelRetry(action, description) {
+    try {
+        return await action();
+    } catch (error) {
+        if (!isProxyLevelNavigationError(error)) throw error;
+        const netCode = extractChromeNetErrorCode(error.message);
+        console.error(`[导航] ${description} 遇到代理/网络层错误 ${netCode}，2s 后经新隧道重试一次...`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        return await action();
+    }
 }
 
 async function checkProxy() {
@@ -1360,10 +1376,13 @@ function classifyTurnstileState(info, { afterClick = false } = {}) {
 // --- 刷新登录页并完整重走等待流程（清旧数据一次 → DOMContentLoaded → 初始化 → 健康检查） ---
 async function reloadLoginChallenge(page, reason = 'refresh') {
     console.log(`[登录阶段] 刷新登录页 challenge，原因: ${reason}`);
-    await page.goto('https://dashboard.katabump.com/auth/login', {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000
-    });
+    await withTunnelRetry(
+        () => page.goto('https://dashboard.katabump.com/auth/login', {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000
+        }),
+        '登录页 challenge 刷新'
+    );
     // goto 后清一次旧数据即可（不要前后各清一次）
     await clearStaleTurnstileData(page);
     // 等 DOM 稳定 + Turnstile 脚本初始化，不要立刻点击
@@ -2104,6 +2123,7 @@ function getUserExitCode(runStatus) {
         case 'login_failed':
             return EXIT_CODE.LOGIN_FAILED;
         case 'login_captcha_required':
+        case 'proxy_retry':
             return EXIT_CODE.PROXY_RETRY;
         case 'captcha_required':
             return EXIT_CODE.RENEW_CAPTCHA_FAILED;
@@ -2116,18 +2136,18 @@ function getUserExitCode(runStatus) {
 
 function selectDecisionAccount(accounts, exitCode) {
     const statusByCode = {
-        [EXIT_CODE.SUCCESS]: 'success',
-        [EXIT_CODE.NOT_READY]: 'not_ready',
-        [EXIT_CODE.ALREADY_RENEWED]: 'already_renewed',
-        [EXIT_CODE.LOGIN_FAILED]: 'login_failed',
-        [EXIT_CODE.RENEW_CAPTCHA_FAILED]: 'captcha_required',
-        [EXIT_CODE.PROXY_RETRY]: 'login_captcha_required',
-        [EXIT_CODE.FATAL]: 'error'
+        [EXIT_CODE.SUCCESS]: ['success'],
+        [EXIT_CODE.NOT_READY]: ['not_ready'],
+        [EXIT_CODE.ALREADY_RENEWED]: ['already_renewed'],
+        [EXIT_CODE.LOGIN_FAILED]: ['login_failed'],
+        [EXIT_CODE.RENEW_CAPTCHA_FAILED]: ['captcha_required'],
+        [EXIT_CODE.PROXY_RETRY]: ['proxy_retry', 'login_captcha_required'],
+        [EXIT_CODE.FATAL]: ['error']
     };
-    const preferredStatus = statusByCode[exitCode];
-    if (preferredStatus) {
+    const preferredStatuses = statusByCode[exitCode];
+    if (preferredStatuses) {
         for (let i = accounts.length - 1; i >= 0; i--) {
-            if (accounts[i].status === preferredStatus) return accounts[i];
+            if (preferredStatuses.includes(accounts[i].status)) return accounts[i];
         }
     }
     return accounts.length > 0 ? accounts[accounts.length - 1] : null;
@@ -2295,14 +2315,20 @@ async function runMain() {
             context = preparedPage.context;
             page = preparedPage.page;
 
-            // 1. 访问登录页
+            // 1. 访问登录页（代理层网络错误先原地重试一次：网关每次 CONNECT 重新选节点）
             console.log('访问登录页面...');
-            await page.goto(TARGET_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await withTunnelRetry(
+                () => page.goto(TARGET_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }),
+                '登录页首跳'
+            );
             await page.evaluate(() => {
                 try { localStorage.clear(); } catch (e) { }
                 try { sessionStorage.clear(); } catch (e) { }
             }).catch(() => {});
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+            await withTunnelRetry(
+                () => page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+                '登录页重载'
+            );
 
             // 登录页 Turnstile 严格状态机：
             // widget 健康 → 点击 → 等 token → token 有值才提交
@@ -3148,7 +3174,7 @@ async function runMain() {
 
                     // 刷新页面重试（这是已知可重试的情况）
                     console.log('   >> 未知状态，刷新重试...');
-                    await page.reload();
+                    await withTunnelRetry(() => page.reload(), '未知状态刷新');
                     await page.waitForTimeout(3000);
                 }
 
@@ -3156,8 +3182,21 @@ async function runMain() {
             }
         } catch (err) {
             console.error(`Error processing user:`, err);
-            runStatus = 'error';
-            blockMessage = err.message;
+            const hasConclusiveStatus = runStatus !== 'unknown' && runStatus !== 'unknown_blocked';
+            if (hasConclusiveStatus) {
+                // 已得到明确业务结果（success / not_ready / login_failed 等），收尾阶段的异常不推翻该结果
+                console.error(`   >> ⚠️ 已有明确结果 (runStatus=${runStatus})，收尾异常不覆盖: ${err.message}`);
+            } else if (PROXY_CONFIG && isProxyLevelNavigationError(err)) {
+                // 预检 CONNECT 成功不代表网关分到的节点可用（隧道能建、数据不通），
+                // 导航阶段的网络层故障应交由外层换节点重试，而非终止整轮
+                const netCode = extractChromeNetErrorCode(err.message);
+                console.error(`   >> ⚠️ 判定为代理层网络错误 (${netCode})，标记 PROXY_RETRY 交由外层换节点重试`);
+                runStatus = 'proxy_retry';
+                blockMessage = `代理层网络错误 (${netCode}): ${err.message}`;
+            } else {
+                runStatus = 'error';
+                blockMessage = err.message;
+            }
         } finally {
             const cleanupResult = await finalizeAccountResources({
                 page,
@@ -3193,6 +3232,8 @@ async function runMain() {
             notificationMessage = `⚠️ KataBump 验证码阻断\n用户: ${displayAccount}\n原因: ${blockMessage}\n请检查验证码状态。`;
         } else if (runStatus === 'login_captcha_required') {
             notificationMessage = `⚠️ KataBump 登录验证码阻断\n用户: ${displayAccount}\n原因: ${blockMessage}\n请解决验证码后重试。`;
+        } else if (runStatus === 'proxy_retry') {
+            notificationMessage = `⚠️ KataBump 代理网络故障\n用户: ${displayAccount}\n原因: ${blockMessage}\n将换代理节点重试。`;
         } else if (runStatus === 'login_failed') {
             notificationMessage = `❌ KataBump 登录失败\n用户: ${displayAccount}\n原因: ${blockMessage}`;
         } else if (runStatus === 'already_renewed') {
@@ -3218,7 +3259,8 @@ async function runMain() {
         const userExitCode = getUserExitCode(runStatus);
         overallExitCode = mergeExitCode(overallExitCode, userExitCode);
 
-        if (runStatus === 'error') {
+        if (runStatus === 'error' || runStatus === 'proxy_retry') {
+            // error: 环境级故障；proxy_retry: 隧道已断，后续账号同样无法访问
             shouldStopAllUsers = true;
         }
 

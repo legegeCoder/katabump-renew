@@ -40,7 +40,7 @@ const CONFIGURED_MAX_PROXY_SWITCHES = parsePositiveNumber(
 const EXIT_CODE = {
     SUCCESS: 0,
     FATAL: 1,
-    PROXY_RETRY: 42,       // 只有这个码才触发代理轮换
+    PROXY_RETRY: 42,       // 只有这个码才触发代理轮换（Turnstile 失败 / 代理层网络错误）
     RENEW_CAPTCHA_FAILED: 43, // Renew ALTCHA 失败，不换代理
     NOT_READY: 3,
     ALREADY_RENEWED: 4,

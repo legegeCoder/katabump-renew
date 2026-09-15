@@ -4,6 +4,8 @@ const {
     buildBrowserLaunchOptions,
     classifyProxyResponse,
     classifyProxyError,
+    extractChromeNetErrorCode,
+    isProxyLevelNavigationError,
     mergeExitCode,
     validateUsersConfig,
     safeAccountLabel,
@@ -63,6 +65,37 @@ async function tests() {
     ]) {
         assert.strictEqual(classifyProxyError(error).category, 'transport_error');
     }
+
+    assert.strictEqual(
+        extractChromeNetErrorCode('page.goto: net::ERR_TIMED_OUT at https://dashboard.katabump.com/auth/login'),
+        'ERR_TIMED_OUT'
+    );
+    assert.strictEqual(extractChromeNetErrorCode('Timeout 60000ms exceeded.'), null);
+    assert.strictEqual(extractChromeNetErrorCode(null), null);
+    for (const code of [
+        'ERR_TIMED_OUT',
+        'ERR_CONNECTION_TIMED_OUT',
+        'ERR_TUNNEL_CONNECTION_FAILED',
+        'ERR_PROXY_CONNECTION_FAILED',
+        'ERR_CONNECTION_RESET',
+        'ERR_CONNECTION_CLOSED',
+        'ERR_EMPTY_RESPONSE',
+        'ERR_NAME_NOT_RESOLVED',
+        'ERR_ADDRESS_UNREACHABLE',
+        'ERR_SOCKS_CONNECTION_FAILED',
+        'ERR_HTTP2_PROTOCOL_ERROR'
+    ]) {
+        const error = new Error(`page.goto: net::${code} at https://dashboard.katabump.com/auth/login`);
+        assert.strictEqual(isProxyLevelNavigationError(error), true, `${code} should be proxy-level`);
+    }
+    for (const code of ['ERR_ABORTED', 'ERR_CERT_AUTHORITY_INVALID', 'ERR_BLOCKED_BY_ADMINISTRATOR']) {
+        assert.strictEqual(isProxyLevelNavigationError(new Error(`net::${code}: blocked`)), false, `${code} must stay fatal`);
+    }
+    assert.strictEqual(isProxyLevelNavigationError(null), false);
+    assert.strictEqual(isProxyLevelNavigationError(undefined), false);
+    assert.strictEqual(isProxyLevelNavigationError(new Error('Timeout 60000ms exceeded.')), false);
+    assert.strictEqual(isProxyLevelNavigationError('net::ERR_TUNNEL_CONNECTION_FAILED: boom'), true);
+    assert.strictEqual(isProxyLevelNavigationError({ message: 'net::ERR_PROXY_CONNECTION_FAILED' }), true);
 
     assert.strictEqual(validateUsersConfig(undefined).fatal, true);
     assert.strictEqual(validateUsersConfig('not-json').fatal, true);
