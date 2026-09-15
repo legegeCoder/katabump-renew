@@ -98,6 +98,8 @@ const HTTP_PROXY = process.env.HTTP_PROXY;
 const TARGET_LOGIN_URL = 'https://dashboard.katabump.com/auth/login';
 const PROXY_DEFAULT_PORTS = { http: '80', socks4: '1080', socks5: '1080' };
 const PROXY_CHECK_TIMEOUT_MS = 10_000;
+// 登录页导航超时：代理池网关节点质量参差，慢节点 60s 内常达不到 domcontentloaded
+const LOGIN_NAV_TIMEOUT_MS = 120_000;
 const CHROME_BOOT_TIMEOUT_MIN_MS = 10_000;
 const CHROME_BOOT_TIMEOUT_MAX_MS = 90_000;
 const CHROME_BOOT_TIMEOUT_DEFAULT_MS = 35_000;
@@ -1379,7 +1381,7 @@ async function reloadLoginChallenge(page, reason = 'refresh') {
     await withTunnelRetry(
         () => page.goto('https://dashboard.katabump.com/auth/login', {
             waitUntil: 'domcontentloaded',
-            timeout: 60000
+            timeout: LOGIN_NAV_TIMEOUT_MS
         }),
         '登录页 challenge 刷新'
     );
@@ -2318,7 +2320,7 @@ async function runMain() {
             // 1. 访问登录页（代理层网络错误先原地重试一次：网关每次 CONNECT 重新选节点）
             console.log('访问登录页面...');
             await withTunnelRetry(
-                () => page.goto(TARGET_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }),
+                () => page.goto(TARGET_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_NAV_TIMEOUT_MS }),
                 '登录页首跳'
             );
             await page.evaluate(() => {
@@ -2326,7 +2328,7 @@ async function runMain() {
                 try { sessionStorage.clear(); } catch (e) { }
             }).catch(() => {});
             await withTunnelRetry(
-                () => page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+                () => page.reload({ waitUntil: 'domcontentloaded', timeout: LOGIN_NAV_TIMEOUT_MS }),
                 '登录页重载'
             );
 
