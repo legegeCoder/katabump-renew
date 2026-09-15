@@ -1878,6 +1878,39 @@ async function isAltchaCheckboxChecked(page, modal) {
     return false;
 }
 
+/**
+ * ALTCHA widget 状态快照（诊断 + error 自动重发依据）。
+ * 返回 { widgets: [{inModal, state, checked, tokenLen, hasVerify}], verifyOutcome }
+ * verifyOutcome 由 programmatic-verify 策略写入 window.__altcha_verify_outcome，
+ * 捕获 verify() Promise 的真实结果（此前 .catch(()=>{}) 会吞掉 challenge 拉取失败）。
+ */
+async function getAltchaStateSnapshot(page, modal) {
+    try {
+        const modalHandle = await modal.elementHandle().catch(() => null);
+        return await page.evaluate((modalEl) => {
+            const widgets = [];
+            for (const w of document.querySelectorAll('altcha-widget, [data-altcha]')) {
+                let state = w.getAttribute ? w.getAttribute('data-state') : null;
+                try {
+                    if (typeof w.getState === 'function') state = String(w.getState());
+                } catch (e) { }
+                const cb = w.querySelector ? w.querySelector('input[type="checkbox"]') : null;
+                const token = w.querySelector ? w.querySelector('input[name="altcha"], input[type="hidden"]') : null;
+                widgets.push({
+                    inModal: Boolean(modalEl && modalEl.contains(w)),
+                    state: state === null ? null : String(state),
+                    checked: Boolean(cb && cb.checked),
+                    tokenLen: token && token.value ? token.value.length : 0,
+                    hasVerify: typeof w.verify === 'function'
+                });
+            }
+            return { widgets, verifyOutcome: window.__altcha_verify_outcome || null };
+        }, modalHandle);
+    } catch (e) {
+        return { widgets: [], verifyOutcome: null };
+    }
+}
+
 /** 检测续期成功文本 */
 function detectRenewSuccess(text) {
     const patterns = [
@@ -2005,19 +2038,36 @@ async function tryClickAltchaCheckbox(page, modal, { renderTimeoutMs = 10000, ve
             // 策略 0（对隐藏/浮层 widget 唯一有效）：直接调用 widget.verify()。
             // 点击 checkbox 本质就是触发 verify()，程序调用与人工点击等价，
             // 且不受 widget 可见性影响（浮层模式下 widget 可能 display:none）。
+            // 优先 modal 内的 widget（页面可能存在多个 widget——隐藏表单/模板，
+            // 全局选取可能调错对象）；verify() Promise 的结果写入
+            // window.__altcha_verify_outcome 供轮询诊断，失败不再被静默吞掉。
             name: 'programmatic-verify',
             pollMs: verifyTimeoutMs + 8000,
             run: async () => {
                 try {
                     return await page.evaluate(() => {
-                        const widgets = document.querySelectorAll('altcha-widget, [data-altcha]');
-                        for (const w of widgets) {
+                        window.__altcha_verify_outcome = null;
+                        const scopes = [document];
+                        // 无需找 modal 元素：querySelectorAll 全局扫描后按 inModal 过滤即可
+                        const all = Array.from(document.querySelectorAll('altcha-widget, [data-altcha]'));
+                        // modal 内的优先（利用 closest 定位任意祖先 modal 容器）
+                        const inModalScope = all.filter(w => w.closest('.modal, [role="dialog"], #renew-modal'));
+                        const ordered = inModalScope.length > 0 ? inModalScope.concat(all.filter(w => !inModalScope.includes(w))) : all;
+                        for (const w of ordered) {
                             if (typeof w.verify === 'function') {
                                 try {
                                     const result = w.verify();
-                                    if (result && typeof result.catch === 'function') result.catch(() => { });
+                                    if (result && typeof result.then === 'function') {
+                                        result.then(
+                                            v => { window.__altcha_verify_outcome = { ok: true, value: String(v) }; },
+                                            e => { window.__altcha_verify_outcome = { ok: false, error: String(e && e.message || e) }; }
+                                        );
+                                    }
                                     return true;
-                                } catch (e) { continue; }
+                                } catch (e) {
+                                    window.__altcha_verify_outcome = { ok: false, error: String(e && e.message || e) };
+                                    continue;
+                                }
                             }
                         }
                         return false;
@@ -2094,16 +2144,53 @@ async function tryClickAltchaCheckbox(page, modal, { renderTimeoutMs = 10000, ve
             const pollMs = strategy.pollMs || verifyTimeoutMs;
             console.log(`[ALTCHA] 策略 ${strategy.name} 已触发，轮询验证状态（最多 ${pollMs}ms）...`);
 
-            // 轮询等待 PoW 完成后 checkbox 变为 checked / 状态变 verified
+            // 轮询等待 PoW 完成后 checkbox 变为 checked / 状态变 verified。
+            // 每次循环读 widget 状态快照：error 状态自动重发 verify() 换新 challenge
+            // （challenge 拉取失败/过期在代理环境下常见，单次 verify 失败不代表无解）。
             const pollStart = Date.now();
+            let lastLoggedState = '';
+            let errorRetryCount = 0;
             while (Date.now() - pollStart < pollMs) {
                 await page.waitForTimeout(1000);
                 if (await isAltchaCheckboxChecked(page, modal)) {
                     console.log(`[ALTCHA] ✅ 策略 ${strategy.name} 验证通过（耗时 ${Date.now() - pollStart}ms）。`);
                     return true;
                 }
+                const snapshot = await getAltchaStateSnapshot(page, modal);
+                const stateSummary = snapshot.widgets.map(w =>
+                    `inModal=${w.inModal} state=${w.state} checked=${w.checked} tokenLen=${w.tokenLen}`
+                ).join(' | ') || 'no-widget';
+                if (stateSummary !== lastLoggedState) {
+                    console.log(`[ALTCHA] 轮询状态: ${stateSummary}${snapshot.verifyOutcome ? ` verifyOutcome=${JSON.stringify(snapshot.verifyOutcome)}` : ''}`);
+                    lastLoggedState = stateSummary;
+                }
+                // error 状态 → challenge 已失效，重发 verify() 拉新 challenge（限 3 次）
+                if (snapshot.widgets.some(w => w.state === 'error') && strategy.name === 'programmatic-verify' && errorRetryCount < 3) {
+                    errorRetryCount++;
+                    console.log(`[ALTCHA] 检测到 error 状态，重发 verify()（第 ${errorRetryCount}/3 次）...`);
+                    await page.evaluate(() => {
+                        const all = Array.from(document.querySelectorAll('altcha-widget, [data-altcha]'));
+                        const inModalScope = all.filter(w => w.closest('.modal, [role="dialog"], #renew-modal'));
+                        for (const w of (inModalScope.length > 0 ? inModalScope : all)) {
+                            if (typeof w.verify === 'function') {
+                                try {
+                                    const r = w.verify();
+                                    if (r && typeof r.then === 'function') {
+                                        r.then(
+                                            v => { window.__altcha_verify_outcome = { ok: true, value: String(v) }; },
+                                            e => { window.__altcha_verify_outcome = { ok: false, error: String(e && e.message || e) }; }
+                                        );
+                                    }
+                                    return true;
+                                } catch (e) { }
+                            }
+                        }
+                        return false;
+                    }).catch(() => {});
+                }
             }
-            console.log(`[ALTCHA] 策略 ${strategy.name} 触发后 ${pollMs}ms 内未验证通过，尝试下一策略。`);
+            const finalSnapshot = await getAltchaStateSnapshot(page, modal);
+            console.log(`[ALTCHA] 策略 ${strategy.name} 触发后 ${pollMs}ms 内未验证通过（终态: ${finalSnapshot.widgets.map(w => `state=${w.state} tokenLen=${w.tokenLen}`).join(' | ') || 'no-widget'}${finalSnapshot.verifyOutcome ? ` verifyOutcome=${JSON.stringify(finalSnapshot.verifyOutcome)}` : ''}），尝试下一策略。`);
         } catch (e) {
             console.log(`[ALTCHA] 策略 ${strategy.name} 异常: ${e.message}`);
         }
