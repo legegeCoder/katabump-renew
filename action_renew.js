@@ -924,18 +924,22 @@ async function getChallengeFrameBox(page) {
 }
 
 // --- CDP 在指定坐标点击；成功返回 true ---
+// 带人手抖动：moved/pressed 同点（hover 即按下目标），released 轻微偏移
 async function cdpClickAt(page, x, y, label = '') {
     console.log(`>> CDP 点击 ${label} 坐标=(${x.toFixed(1)}, ${y.toFixed(1)})`);
     const client = await page.context().newCDPSession(page);
+    const jitter = () => (Math.random() - 0.5) * 3;
     try {
-        await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-        await new Promise(r => setTimeout(r, 60 + Math.random() * 100));
+        const mx = x + jitter();
+        const my = y + jitter();
+        await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: mx, y: my });
+        await new Promise(r => setTimeout(r, 60 + Math.random() * 120));
         await client.send('Input.dispatchMouseEvent', {
-            type: 'mousePressed', x, y, button: 'left', clickCount: 1
+            type: 'mousePressed', x: mx, y: my, button: 'left', clickCount: 1
         });
-        await new Promise(r => setTimeout(r, 40 + Math.random() * 80));
+        await new Promise(r => setTimeout(r, 45 + Math.random() * 75));
         await client.send('Input.dispatchMouseEvent', {
-            type: 'mouseReleased', x, y, button: 'left', clickCount: 1
+            type: 'mouseReleased', x: mx + jitter(), y: my + jitter(), button: 'left', clickCount: 1
         });
         return true;
     } catch (e) {
@@ -946,26 +950,110 @@ async function cdpClickAt(page, x, y, label = '') {
     }
 }
 
+// --- 读取注入脚本 hook 捕获的真实 checkbox 坐标 ---
+// __turnstile_data 挂在 challenge iframe（或其子 frame）的 window 上，值为
+// 相对该 iframe 视口的比率；映射到 frame element 的页面坐标才是 CDP 可用的落点。
+// 跨 frame 读取带超时，frame 正在导航/销毁时跳过。
+async function getTurnstileCheckboxPagePosition(targetFrame, targetBox, maxWaitMs = 2000) {
+    if (!targetFrame) return null;
+    const framesToCheck = [targetFrame, ...targetFrame.childFrames()];
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+        for (const frame of framesToCheck) {
+            try {
+                const data = await Promise.race([
+                    frame.evaluate(() => {
+                        const d = window.__turnstile_data;
+                        if (d && Number.isFinite(d.xRatio) && Number.isFinite(d.yRatio)
+                            && d.xRatio > 0 && d.xRatio < 1 && d.yRatio > 0 && d.yRatio < 1) {
+                            return d;
+                        }
+                        return null;
+                    }),
+                    new Promise(resolve => setTimeout(() => resolve(null), 1500))
+                ]);
+                if (!data) continue;
+                let baseBox = targetBox;
+                if (frame !== targetFrame) {
+                    const el = await frame.frameElement().catch(() => null);
+                    baseBox = el ? await el.boundingBox().catch(() => null) : null;
+                    if (!baseBox) continue;
+                }
+                const x = baseBox.x + data.xRatio * baseBox.width;
+                const y = baseBox.y + data.yRatio * baseBox.height;
+                return {
+                    x: Math.min(Math.max(x, targetBox.x + 4), targetBox.x + targetBox.width - 4),
+                    y: Math.min(Math.max(y, targetBox.y + 4), targetBox.y + targetBox.height - 4),
+                    source: frame === targetFrame ? 'shadow-dom-ratio' : 'shadow-dom-ratio-child'
+                };
+            } catch (e) {
+                // frame 可能正在导航/已销毁，继续检查其他 frame
+            }
+        }
+        await new Promise(resolve => setTimeout(resolve, 400));
+    }
+    return null;
+}
+
 // --- 单次点击 challenge checkbox（一轮只点一次，不轮询多点/多策略） ---
+// 落点优先级：__turnstile_data 真实 checkbox 坐标（shadow DOM hook）→ 旧固定偏移（逐轮轮换）
 // 返回 { sent: boolean, x, y, urlBefore }
-async function attemptTurnstileSingleClick(page) {
+async function attemptTurnstileSingleClick(page, clickAttempt = 1) {
     const target = await getChallengeFrameBox(page);
     if (!target || !target.box) {
         console.log('[登录阶段] challenge frame box 未找到，无法点击');
         return { sent: false, x: null, y: null, urlBefore: null };
     }
-    const { box, url } = target;
-    // 固定左侧 checkbox 区域（已验证过的点）
-    const x = box.x + 28;
-    const y = box.y + box.height / 2;
+    const { box, url, frame } = target;
     console.log(`[登录阶段] challenge frame 已找到`);
     console.log(`[登录阶段] challenge box: x=${box.x.toFixed(1)} y=${box.y.toFixed(1)} w=${box.width.toFixed(1)} h=${box.height.toFixed(1)}`);
-    console.log(`[登录阶段] 本轮只点击一次 checkbox: (${x.toFixed(1)}, ${y.toFixed(1)}) url=${(url || '').substring(0, 90)}`);
+
+    let x;
+    let y;
+    let clickSource = 'fixed-offset';
+    const hooked = await getTurnstileCheckboxPagePosition(frame, box);
+    if (hooked) {
+        // shadow DOM hook 捕获的真实 checkbox 中心坐标
+        x = hooked.x;
+        y = hooked.y;
+        clickSource = hooked.source;
+    } else {
+        console.log('[登录阶段] 未捕获 __turnstile_data，尝试 locator 直接定位 checkbox...');
+        // locator 可穿透 open shadow DOM；boundingBox 已是主 frame 视口坐标
+        let cbBox = null;
+        try {
+            cbBox = await frame.locator('input[type="checkbox"]').first().boundingBox();
+        } catch (e) { }
+        if (!cbBox || !(cbBox.width >= 10 && cbBox.height >= 10)) {
+            // 也扫子 frame（checkbox 可能渲染在嵌套 iframe 里）
+            for (const child of frame.childFrames()) {
+                try {
+                    const b = await child.locator('input[type="checkbox"]').first().boundingBox();
+                    if (b && b.width >= 10 && b.height >= 10) { cbBox = b; break; }
+                } catch (e) { }
+            }
+        }
+        if (cbBox) {
+            x = cbBox.x + cbBox.width / 2;
+            y = cbBox.y + cbBox.height / 2;
+            clickSource = 'locator-checkbox';
+            console.log(`[登录阶段] locator 定位到 checkbox: (${x.toFixed(1)}, ${y.toFixed(1)})`);
+        } else {
+            console.log('[登录阶段] locator 未找到可见 checkbox，回退固定偏移落点');
+            // 旧偏移曾长期可用，但 Cloudflare 改版后 checkbox 可能不在 frame 左侧固定位置；
+            // 逐轮轮换偏移，避免多轮反复点同一个空白点
+            const offsetXByAttempt = [28, 36, 20];
+            const offsetX = offsetXByAttempt[(clickAttempt - 1) % offsetXByAttempt.length];
+            x = box.x + offsetX;
+            y = box.y + box.height / 2;
+        }
+    }
+    console.log(`[登录阶段] 本轮只点击一次 checkbox: (${x.toFixed(1)}, ${y.toFixed(1)}) 来源=${clickSource} url=${(url || '').substring(0, 90)}`);
 
     try {
         await page.mouse.move(x - 25, y - 12, { steps: 6 });
         await page.waitForTimeout(100 + Math.random() * 100);
-        const ok = await cdpClickAt(page, x, y, 'checkbox-left-28');
+        const ok = await cdpClickAt(page, x, y, `checkbox-${clickSource}`);
         console.log(`[登录阶段] 点击事件实际发送=${ok}`);
         return { sent: ok, x, y, urlBefore: url || '' };
     } catch (e) {
@@ -1539,7 +1627,7 @@ async function solveLoginTurnstile(page, totalTimeoutMs = 180000) {
             return { ok: true, state: 'turnstile_token_ready', message: 'Turnstile token ready (auto)' };
         }
 
-        const clickResult = await attemptTurnstileSingleClick(page);
+        const clickResult = await attemptTurnstileSingleClick(page, attempt);
         if (!clickResult.sent) {
             lastState = 'turnstile_click_target_missing';
             if (attempt >= maxAttempts) {
