@@ -2726,7 +2726,7 @@ async function runMain() {
                     const beforeUrl = page.url();
                     // 首个候选等 15s 覆盖 SPA 渲染延迟；后续候选降级匹配，各等 3s
                     const seeCandidates = [
-                        { locator: page.getByRole('link', { name: 'See', exact: true }).first(), timeout: 15000 },
+                        { locator: page.getByRole('link', { name: 'See', exact: true }).first(), timeout: 30000 },
                         { locator: page.getByRole('button', { name: 'See', exact: true }).first(), timeout: 3000 },
                         { locator: page.getByRole('link', { name: /^see$/i }).first(), timeout: 3000 },
                         { locator: page.getByRole('button', { name: /^see$/i }).first(), timeout: 3000 },
@@ -2781,8 +2781,26 @@ async function runMain() {
 
                         if (!(await renewBtn.isVisible().catch(() => false))) {
                             // 页面可能仍在加载（刚点完 See 跳转详情页），先重试几次再放弃
-                            if (attempt <= 2) {
-                                console.log(`未找到 Renew 按钮，页面可能仍在加载， ${(attempt)}s 后重试...`);
+                            if (attempt <= 5) {
+                                // 回头检查 See 链接：登录后服务器列表是 AJAX 异步渲染，
+                                // 慢代理下常在 See 探测窗口（27s）结束后才出现。
+                                // Renew 循环是最后能补救的地方——发现 See 就点进详情页。
+                                // href 带 ${e.id} 的是 <script> 内的渲染模板，不构成 DOM 元素，
+                                // 但仍排除非数字 id 以防万一。
+                                const seeLink = page.locator('a[href*="/servers/edit?id="]:not([href*="$"])').first();
+                                if (await seeLink.isVisible().catch(() => false)) {
+                                    console.log('[Renew] Renew 按钮未出现，但发现服务器 See 链接，点击进入详情页...');
+                                    try {
+                                        await seeLink.click({ timeout: 10000 });
+                                        await page.waitForURL(url => /servers\/edit/i.test(String(url)), { timeout: 20000 }).catch(() => { });
+                                        await page.waitForLoadState('domcontentloaded').catch(() => { });
+                                        console.log(`[Renew] 详情页当前 URL: ${page.url()}`);
+                                        continue;
+                                    } catch (e) {
+                                        console.log(`[Renew] See 链接点击失败: ${e.message.split('\n')[0]}`);
+                                    }
+                                }
+                                console.log(`未找到 Renew 按钮，页面可能仍在加载， ${attempt * 3}s 后重试...`);
                                 await new Promise(resolve => setTimeout(resolve, attempt * 3000));
                                 continue;
                             }
