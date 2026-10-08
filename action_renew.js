@@ -98,6 +98,8 @@ const HTTP_PROXY = process.env.HTTP_PROXY;
 const TARGET_LOGIN_URL = 'https://dashboard.katabump.com/auth/login';
 const PROXY_DEFAULT_PORTS = { http: '80', socks4: '1080', socks5: '1080' };
 const PROXY_CHECK_TIMEOUT_MS = 10_000;
+// 预检 CONNECT 成功后真实 HTTPS GET 的响应等待上限（短超时捕捉"隧道能建、数据黑洞"节点）
+const PROXY_DATA_WAIT_TIMEOUT_MS = 8_000;
 // 登录页导航超时：代理池网关节点质量参差，慢节点 60s 内常达不到 domcontentloaded
 const LOGIN_NAV_TIMEOUT_MS = 120_000;
 const CHROME_BOOT_TIMEOUT_MIN_MS = 10_000;
@@ -371,6 +373,10 @@ function checkHttpProxyTunnel({ host, port, username, password, targetUrl, timeo
         let stage = 'connect'; // connect → tls → request
         let buffer = Buffer.alloc(0);
         let tlsSocket = null;
+        // 阶段化超时：connect 用 timeoutMs；TLS 握手 + 响应等待各用 dataWaitTimeoutMs。
+        // 响应阶段单独短超时，才能捕捉"隧道能建、数据黑洞"的坏节点。
+        const dataWaitTimeoutMs = Math.min(timeoutMs, PROXY_DATA_WAIT_TIMEOUT_MS);
+        let dataWaitStart = 0;
         const socket = net.connect({ host, port: Number(port) });
 
         const finish = (result) => {
@@ -419,6 +425,10 @@ function checkHttpProxyTunnel({ host, port, username, password, targetUrl, timeo
                     `Accept-Language: en-US,en;q=0.9\r\n` +
                     `Connection: close\r\n\r\n`
                 );
+                // 真实 HTTPS GET 已发出但迟迟无响应：黑洞节点的典型症状
+                // （隧道能建、数据不通）。计时器在 request 阶段接管。
+                dataWaitStart = Date.now();
+                socket.setTimeout(dataWaitTimeoutMs);
             });
             tlsSocket.on('error', (error) => failTransport(`TLS 握手失败: ${error.message}`));
             tlsSocket.on('close', () => {
@@ -438,8 +448,13 @@ function checkHttpProxyTunnel({ host, port, username, password, targetUrl, timeo
 
         socket.setTimeout(timeoutMs);
         socket.on('timeout', () => {
+            const elapsed = dataWaitStart ? Date.now() - dataWaitStart : 0;
             socket.destroy();
-            finish({ ok: false, reachable: false, status: null, category: 'transport_error', error: `HTTP 代理 CONNECT 超时 (${timeoutMs}ms)` });
+            if (dataWaitStart && stage === 'request') {
+                failTransport(`隧道已建立但目标 ${dataWaitTimeoutMs}ms 内无响应（疑似黑洞节点，等待耗时 ${elapsed}ms）`);
+            } else {
+                finish({ ok: false, reachable: false, status: null, category: 'transport_error', error: `HTTP 代理 CONNECT 超时 (${timeoutMs}ms)` });
+            }
         });
         socket.on('error', (error) => {
             finish({ ok: false, reachable: false, status: null, category: 'transport_error', error: error.message });
@@ -464,14 +479,19 @@ function checkHttpProxyTunnel({ host, port, username, password, targetUrl, timeo
 // 瞬时黑洞节点大概率被绕过，比整个流程重启（外层换代理重跑）便宜得多。
 // 覆盖两类症状：net::ERR_* 连接层故障，以及"已导航但响应流中断"的导航超时。
 async function withTunnelRetry(action, description) {
-    try {
-        return await action();
-    } catch (error) {
-        if (!isProxyLevelNavigationError(error) && !isNavigationTimeoutError(error)) throw error;
-        console.error(`[导航] ${description} 遇到代理/网络层错误（${error.message.split('\n')[0]}），2s 后经新隧道重试一次...`);
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        return await action();
+    const maxNavigationAttempts = 3;
+    for (let attempt = 1; attempt <= maxNavigationAttempts; attempt++) {
+        try {
+            return await action();
+        } catch (error) {
+            const retryable = isProxyLevelNavigationError(error) || isNavigationTimeoutError(error);
+            if (!retryable || attempt === maxNavigationAttempts) throw error;
+            const delayMs = 2000 + Math.floor(Math.random() * 1500);
+            console.error(`[导航] ${description} 遇到代理/网络层错误（${error.message.split('\n')[0]}），第 ${attempt}/${maxNavigationAttempts - 1} 次重试，${delayMs}ms 后经新隧道重试...`);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
     }
+    throw new Error('unreachable');
 }
 
 async function checkProxy() {
@@ -3369,7 +3389,7 @@ async function runMain() {
 
                     // 刷新页面重试（这是已知可重试的情况）
                     console.log('   >> 未知状态，刷新重试...');
-                    await withTunnelRetry(() => page.reload(), '未知状态刷新');
+                    await withTunnelRetry(() => page.reload({ timeout: 60000 }), '未知状态刷新');
                     await page.waitForTimeout(3000);
                 }
 

@@ -83,6 +83,7 @@ async function tests() {
         'ERR_EMPTY_RESPONSE',
         'ERR_NAME_NOT_RESOLVED',
         'ERR_ADDRESS_UNREACHABLE',
+        'ERR_SOCKET_NOT_CONNECTED',
         'ERR_SOCKS_CONNECTION_FAILED',
         'ERR_HTTP2_PROTOCOL_ERROR'
     ]) {
