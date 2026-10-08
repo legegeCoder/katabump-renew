@@ -116,6 +116,19 @@ function isRealProxyNetworkFailure(attempt) {
     );
 }
 
+// 代理出口 IP 被 Cloudflare 风控标记的典型症状：Turnstile challenge 进度跑完
+// 但始终不发 token（登录验证码阻断），换代理节点也难逃同一网关的风控画像。
+// 这类退出（42/login_captcha_required）应触发直连兼底：GitHub runner IP
+// 信誉良好，直连大概率能过盾（已验证：无代理 run 1.5s 内拿到 token）。
+function isProxyCaptchaFailure(attempt) {
+    return Boolean(
+        attempt &&
+        attempt.proxy !== 'direct' &&
+        attempt.code === EXIT_CODE.PROXY_RETRY &&
+        attempt.status === 'login_captcha_required'
+    );
+}
+
 function makeAttemptRecord(attempt, parsed, childResult) {
     const actionResult = childResult.actionResult || {};
     const code = Number.isInteger(actionResult.exitCode) ? actionResult.exitCode : childResult.code;
@@ -763,10 +776,13 @@ async function runProxyWorkflow(attempts) {
         !directFallbackAttempted &&
         (candidates.length === 0 || singleProxyMode) &&
         attempts.length > 0 &&
-        attempts.every(isRealProxyNetworkFailure)
+        (attempts.every(isRealProxyNetworkFailure) || attempts.every(isProxyCaptchaFailure))
     ) {
         directFallbackAttempted = true;
-        console.log('[proxy-runner] 所有代理网络故障，启用直连 fallback');
+        const captchaBlocked = attempts.every(isProxyCaptchaFailure);
+        console.log(captchaBlocked
+            ? '[proxy-runner] 所有代理尝试均被登录验证码阻断（疑似代理出口 IP 被 Cloudflare 风控标记），启用直连兼底'
+            : '[proxy-runner] 所有代理网络故障，启用直连 fallback');
 
         const directResult = await runActionRenew(null, attempts.length + 1);
         const directRecord = makeAttemptRecord(attempts.length + 1, null, directResult);
@@ -826,6 +842,7 @@ module.exports = {
     parsePositiveNumber,
     normalizeFinalCode,
     isRealProxyNetworkFailure,
+    isProxyCaptchaFailure,
     getMaxProxyAttempts,
     buildProxyCandidateQueue,
     calculateCooldownUntil,

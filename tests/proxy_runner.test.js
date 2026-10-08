@@ -28,6 +28,7 @@ function tests() {
     assert.strictEqual(typeof mod.calculateCooldownUntil, 'function');
     assert.strictEqual(typeof mod.loadCooldowns, 'function');
     assert.strictEqual(typeof mod.isRealProxyNetworkFailure, 'function');
+    assert.strictEqual(typeof mod.isProxyCaptchaFailure, 'function');
     assert.strictEqual(typeof mod.proxyKey, 'function');
     assert.strictEqual(typeof mod.safeProxyId, 'function');
 
@@ -295,6 +296,13 @@ function tests() {
     }));
     assert.strictEqual(mod.isRealProxyNetworkFailure(proxyFailureAttempts[0]), true);
     assert.strictEqual(mod.isRealProxyNetworkFailure({ ...proxyFailureAttempts[0], status: 'login_captcha_required' }), false);
+
+    // 代理出口 IP 被 CF 风控标记：42/login_captcha_required → 触发直连兼底
+    const captchaFailureAttempts = proxyFailureAttempts.map(a => ({ ...a, status: 'login_captcha_required' }));
+    assert.strictEqual(mod.isProxyCaptchaFailure(captchaFailureAttempts[0]), true);
+    assert.strictEqual(mod.isProxyCaptchaFailure({ ...captchaFailureAttempts[0], proxy: 'direct' }), false);
+    assert.strictEqual(mod.isProxyCaptchaFailure({ ...captchaFailureAttempts[0], status: 'proxy_retry' }), false);
+    assert.strictEqual(mod.isProxyCaptchaFailure(null), false);
     const directNotReady = {
         attempt: 11,
         proxy: 'direct',
